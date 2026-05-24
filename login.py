@@ -6,11 +6,13 @@ import threading
 import time
 import requests
 import re
+from urllib.parse import urlparse
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -24,13 +26,15 @@ app = Flask(__name__)
 # never by the client-supplied wallet address.
 user_sessions = {}
 session_lock = threading.Lock()
-SESSION_TTL_SECONDS = 15 * 60
+SESSION_TTL_SECONDS = 5 * 60
 SESSION_COOKIE_NAME = "msu_session"
 # Disable only for plain-HTTP local dev: COOKIE_SECURE=0
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 # Hard ceiling so a step-1 flood cannot grow user_sessions without bound.
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "1000"))
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "30/minute")
+# Extra origins beyond same-host. Comma-separated. Empty = same-host only.
+ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()}
 
 # In-memory storage is fine for Railway's typical single-instance deploy.
 # Set RATELIMIT_STORAGE_URI=redis://... when scaling beyond one container.
@@ -39,6 +43,33 @@ limiter = Limiter(
     app=app,
     default_limits=["200/minute"],
     storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
+)
+
+# Template currently has inline <script> and <style>, so 'unsafe-inline' is
+# required for now. Google Fonts is loaded from a CDN.
+_csp = {
+    "default-src": "'self'",
+    "script-src": ["'self'", "'unsafe-inline'"],
+    "style-src": ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+    "font-src": ["'self'", "https://fonts.gstatic.com"],
+    "img-src": ["'self'", "data:"],
+    "connect-src": "'self'",
+    "frame-ancestors": "'none'",
+    "base-uri": "'self'",
+    "form-action": "'self'",
+}
+# force_https is OFF by default because Railway terminates TLS at its edge
+# and forwards plain HTTP to the container. Enable FORCE_HTTPS=1 once ProxyFix
+# is wired up so request.is_secure reflects the real client connection.
+Talisman(
+    app,
+    content_security_policy=_csp,
+    force_https=os.environ.get("FORCE_HTTPS", "0") == "1",
+    strict_transport_security=True,
+    strict_transport_security_max_age=31536000,
+    frame_options="DENY",
+    referrer_policy="no-referrer",
+    session_cookie_secure=COOKIE_SECURE,
 )
 JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
@@ -272,6 +303,27 @@ def refresh_web_token(cookies, auth_jwt=None):
     wrt = read_nested(result, "wrt") or read_nested(result, "msu_wrt")
     merged = inject_manual_jwt(merged, msu_wat=wat, msu_wrt=wrt)
     return merged
+
+
+@app.before_request
+def _require_same_origin():
+    """Reject state-changing requests whose Origin isn't same-host
+    (or an explicit ALLOWED_ORIGINS entry). Defends against any future
+    code change that loses CSRF protection by accident."""
+    if request.method == "GET":
+        return None
+    origin = request.headers.get("Origin", "")
+    if not origin:
+        return jsonify({"success": False, "error": "Missing Origin"}), 403
+    try:
+        origin_host = urlparse(origin).netloc.lower()
+    except Exception:
+        return jsonify({"success": False, "error": "Bad Origin"}), 403
+    if origin_host == request.host.lower():
+        return None
+    if origin in ALLOWED_ORIGINS:
+        return None
+    return jsonify({"success": False, "error": "Origin not allowed"}), 403
 
 
 @app.route('/')
