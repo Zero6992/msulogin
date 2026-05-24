@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request, jsonify, make_response
+import logging
 import os
 import secrets
 import threading
@@ -400,12 +401,6 @@ def launch():
             if result is None:
                 return jsonify({"success": False, "error": "Failed to sign in"}), 400
 
-            primary_result = result
-            primary_cookies = cookies
-            primary_status = status_code
-            retry_result = None
-            retry_status = None
-
             # Store cookies for this user (og behavior + merge).
             merged = merge_cookies(user_cookies, cookies)
             step2_error = is_error_result(result, status_code)
@@ -463,19 +458,8 @@ def launch():
                     "success": True,
                     "has_jwt": bool(merged.get("msu_wat") or merged.get("msu_wrt")),
                     "has_auth_jwt": bool(auth_jwt),
-                    "step2_message": result_message(result),
                     "step2_error": step2_error,
                     "step2_error_detail": extract_error_message(result, status_code),
-                    "step2_status": status_code,
-                    "step2_result_keys": list(result.keys()) if isinstance(result, dict) else [],
-                    "step2_cookie_keys": sorted(list((cookies or {}).keys())),
-                    "step2_primary_error_detail": extract_error_message(primary_result, primary_status),
-                    "step2_login_address": login_address,
-                    "step2_retry_error_detail": (
-                        extract_error_message(retry_result, retry_status)
-                        if retry_result is not None
-                        else ""
-                    ),
                 }
             )
 
@@ -600,8 +584,12 @@ def launch():
         else:
             return jsonify({"success": False, "error": "Invalid step"}), 400
 
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception:
+        # Hide internals from the client; surface a correlation ID so an
+        # operator can look the full traceback up in server logs.
+        error_id = secrets.token_hex(8)
+        logging.getLogger(__name__).exception("launch failed [id=%s]", error_id)
+        return jsonify({"success": False, "error": "Internal error", "id": error_id}), 500
 
 
 if __name__ == '__main__':
