@@ -11,6 +11,8 @@ SESSION_TTL_SECONDS = 15 * 60
 JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
 )
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+SIGNATURE_RE = re.compile(r"^0x[0-9a-fA-F]{130}$")
 DEFAULT_HEADERS = {
     "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -240,8 +242,8 @@ def launch():
         except (TypeError, ValueError):
             return jsonify({"success": False, "error": "Invalid step"}), 400
 
-        if not isinstance(public_address, str) or not public_address.strip():
-            return jsonify({"success": False, "error": "Missing wallet address"}), 400
+        if not isinstance(public_address, str) or not ADDRESS_RE.match(public_address.strip()):
+            return jsonify({"success": False, "error": "Invalid wallet address"}), 400
         public_address = public_address.strip()
 
         # Get stored cookies for this user
@@ -306,8 +308,9 @@ def launch():
 
         # Step 2: signin-wallet
         elif step == 2:
-            if not isinstance(signature1, str) or not signature1.strip():
-                return jsonify({"success": False, "error": "Missing signature1"}), 400
+            if not isinstance(signature1, str) or not SIGNATURE_RE.match(signature1.strip()):
+                return jsonify({"success": False, "error": "Invalid signature1"}), 400
+            signature1 = signature1.strip()
 
             login_address = state.get("login_address") or public_address
             request_data = {
@@ -433,8 +436,9 @@ def launch():
 
         # Step 4: web to game token and generate launch command
         elif step == 4:
-            if not isinstance(signature2, str) or not signature2.strip():
-                return jsonify({"success": False, "error": "Missing signature2"}), 400
+            if not isinstance(signature2, str) or not SIGNATURE_RE.match(signature2.strip()):
+                return jsonify({"success": False, "error": "Invalid signature2"}), 400
+            signature2 = signature2.strip()
 
             # Optional manual JWT from frontend.
             manual_msu_wat = data.get("msu_wat") or data.get("jwt")
