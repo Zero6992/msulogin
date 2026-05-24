@@ -13,6 +13,7 @@ from eth_account.messages import encode_defunct
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -21,6 +22,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Railway terminates TLS at its edge and forwards X-Forwarded-* headers.
+# Trust one hop so request.remote_addr, request.scheme, and request.host
+# reflect the real client instead of the edge proxy.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # Sessions keyed by server-issued opaque ID (delivered via HttpOnly cookie),
 # never by the client-supplied wallet address.
@@ -76,6 +81,10 @@ JWT_RE = re.compile(
 )
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SIGNATURE_RE = re.compile(r"^0x[0-9a-fA-F]{130}$")
+# Base64/base64url alphabet. The gt value lands inside single-quoted JSON
+# inside a msul:// URL; rejecting anything else prevents an upstream-supplied
+# token from breaking out of the quoting or injecting launcher flags.
+GT_RE = re.compile(r"^[A-Za-z0-9_.+\-/=]+$")
 
 
 def verify_signature(address, message, signature):
@@ -495,7 +504,10 @@ def launch():
                 if token and token not in seen:
                     seen.add(token)
                     uniq.append(token)
-            jwt_candidates = uniq[:12]
+            # Cap is intentionally tight: each candidate triggers a verify
+            # round-trip in pick_auth_jwt, so a wide regex match would
+            # amplify one inbound call into many outbound msu.io calls.
+            jwt_candidates = uniq[:3]
 
             # Do not issue extra auth requests when upstream Step2 is already an error.
             if not step2_error:
@@ -624,7 +636,7 @@ def launch():
                 })
 
             gt = read_nested(result, "gt")
-            if isinstance(gt, str) and gt:
+            if isinstance(gt, str) and GT_RE.match(gt):
                 command = (
                     f"msul://launch/ -mode:launch -game:'106690@d811' "
                     f"-passarg:'{{\"gt\":\"{gt}\"}}' "
