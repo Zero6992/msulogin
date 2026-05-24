@@ -1,18 +1,40 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, make_response
+import os
+import secrets
 import time
 import requests
 import re
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
+
 app = Flask(__name__)
 
-# Store sessions per user address
+# Sessions keyed by server-issued opaque ID (delivered via HttpOnly cookie),
+# never by the client-supplied wallet address.
 user_sessions = {}
 SESSION_TTL_SECONDS = 15 * 60
+SESSION_COOKIE_NAME = "msu_session"
+# Disable only for plain-HTTP local dev: COOKIE_SECURE=0
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
 )
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SIGNATURE_RE = re.compile(r"^0x[0-9a-fA-F]{130}$")
+
+
+def verify_signature(address, message, signature):
+    """Recover signer from an EIP-191 personal_sign signature and compare."""
+    if not (isinstance(address, str) and isinstance(message, str) and isinstance(signature, str)):
+        return False
+    try:
+        recovered = Account.recover_message(
+            encode_defunct(text=message), signature=signature
+        )
+        return recovered.lower() == address.lower()
+    except Exception:
+        return False
 DEFAULT_HEADERS = {
     "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -244,15 +266,27 @@ def launch():
         except (TypeError, ValueError):
             return jsonify({"success": False, "error": "Invalid step"}), 400
 
-        if not isinstance(public_address, str) or not ADDRESS_RE.match(public_address.strip()):
-            return jsonify({"success": False, "error": "Invalid wallet address"}), 400
-        public_address = public_address.strip()
-
-        # Get stored cookies for this user
-        state = user_sessions.get(public_address, {})
-        user_cookies = state.get("cookies", {})
-        auth_jwt = state.get("auth_jwt")
-        jwt_candidates = list(state.get("jwt_candidates", []))
+        # Step 1 accepts the address from the body and creates a fresh server
+        # session. Steps 2-4 must present the session cookie issued at step 1;
+        # the address is read from server state, never re-trusted from the body.
+        if step == 1:
+            if not isinstance(public_address, str) or not ADDRESS_RE.match(public_address.strip()):
+                return jsonify({"success": False, "error": "Invalid wallet address"}), 400
+            public_address = public_address.strip().lower()
+            sid = None
+            state = {}
+            user_cookies = {}
+            auth_jwt = None
+            jwt_candidates = []
+        else:
+            sid = request.cookies.get(SESSION_COOKIE_NAME)
+            state = user_sessions.get(sid) if sid else None
+            if not state:
+                return jsonify({"success": False, "error": "Session expired or missing"}), 401
+            public_address = state["address"]
+            user_cookies = state.get("cookies", {})
+            auth_jwt = state.get("auth_jwt")
+            jwt_candidates = list(state.get("jwt_candidates", []))
 
         # Step 1: can-signin, account lookup, and get web message.
         if step == 1:
@@ -292,27 +326,45 @@ def launch():
             )
             pre_cookies = merge_cookies(pre_cookies, message_cookies)
 
-            # Create/refresh user session container at step1.
-            user_sessions[public_address] = {
+            if not (result and "message" in result):
+                return jsonify({"success": False, "error": "Failed to get message"}), 400
+
+            # Mint a fresh server-side session ID and bind it to the address.
+            # The address is stored server-side so the client cannot pivot
+            # to another user's session by changing the request body.
+            sid = secrets.token_urlsafe(32)
+            user_sessions[sid] = {
+                "address": public_address,
                 "cookies": pre_cookies,
                 "created_at": time.time(),
                 "auth_jwt": None,
                 "jwt_candidates": [],
                 "login_address": login_address,
+                "step1_message": result["message"],
+                "step3_message": None,
             }
 
-            if result and "message" in result:
-                return jsonify(
-                    {"success": True, "message": result["message"], "login_address": login_address}
-                )
-            else:
-                return jsonify({"success": False, "error": "Failed to get message"}), 400
+            resp = make_response(jsonify(
+                {"success": True, "message": result["message"], "login_address": login_address}
+            ))
+            resp.set_cookie(
+                SESSION_COOKIE_NAME, sid,
+                httponly=True, secure=COOKIE_SECURE, samesite="Strict",
+                max_age=SESSION_TTL_SECONDS,
+            )
+            return resp
 
         # Step 2: signin-wallet
         elif step == 2:
             if not isinstance(signature1, str) or not SIGNATURE_RE.match(signature1.strip()):
                 return jsonify({"success": False, "error": "Invalid signature1"}), 400
             signature1 = signature1.strip()
+
+            # Verify the signature was produced by the session's wallet
+            # over the exact message MSU asked us to sign at step 1.
+            step1_message = state.get("step1_message")
+            if not step1_message or not verify_signature(public_address, step1_message, signature1):
+                return jsonify({"success": False, "error": "Signature does not match wallet"}), 403
 
             login_address = state.get("login_address") or public_address
             request_data = {
@@ -377,13 +429,13 @@ def launch():
                 if not auth_jwt and merged.get("msu_wat"):
                     auth_jwt = merged.get("msu_wat")
 
-            user_sessions[public_address] = {
+            user_sessions[sid].update({
                 "cookies": merged,
                 "created_at": time.time(),
                 "auth_jwt": auth_jwt,
                 "jwt_candidates": jwt_candidates,
                 "login_address": login_address,
-            }
+            })
 
             return jsonify(
                 {
@@ -422,16 +474,18 @@ def launch():
                 merged = refresh_web_token(merged, auth_jwt=auth_jwt)
                 if not auth_jwt and merged.get("msu_wat"):
                     auth_jwt = merged.get("msu_wat")
-                user_sessions[public_address] = {
+                user_sessions[sid].update({
                     "cookies": merged,
                     "created_at": time.time(),
                     "auth_jwt": auth_jwt,
                     "jwt_candidates": jwt_candidates,
                     "login_address": login_address,
-                }
+                })
                 user_cookies = merged
 
             if result and "message" in result:
+                # Remember the exact message so we can verify signature2 at step 4.
+                user_sessions[sid]["step3_message"] = result["message"]
                 return jsonify({"success": True, "message": result["message"]})
             else:
                 return jsonify({"success": False, "error": "Failed to get game message"}), 400
@@ -441,6 +495,10 @@ def launch():
             if not isinstance(signature2, str) or not SIGNATURE_RE.match(signature2.strip()):
                 return jsonify({"success": False, "error": "Invalid signature2"}), 400
             signature2 = signature2.strip()
+
+            step3_message = state.get("step3_message")
+            if not step3_message or not verify_signature(public_address, step3_message, signature2):
+                return jsonify({"success": False, "error": "Signature does not match wallet"}), 403
 
             # Optional manual JWT from frontend.
             manual_msu_wat = data.get("msu_wat") or data.get("jwt")
@@ -491,12 +549,12 @@ def launch():
             # Keep latest cookies for retry diagnostics.
             if cookies:
                 merged = merge_cookies(user_cookies, cookies)
-                user_sessions[public_address] = {
+                user_sessions[sid].update({
                     "cookies": merged,
                     "created_at": time.time(),
                     "auth_jwt": auth_jwt,
                     "jwt_candidates": jwt_candidates,
-                }
+                })
 
             gt = read_nested(result, "gt")
             if isinstance(gt, str) and gt:
@@ -508,10 +566,12 @@ def launch():
                 )
 
                 # Clean up stored cookies
-                if public_address in user_sessions:
-                    del user_sessions[public_address]
+                if sid in user_sessions:
+                    del user_sessions[sid]
 
-                return jsonify({"success": True, "command": command})
+                resp = make_response(jsonify({"success": True, "command": command}))
+                resp.delete_cookie(SESSION_COOKIE_NAME)
+                return resp
             else:
                 error_msg = extract_error_message(result)
                 return jsonify({"success": False, "error": f"Failed to get game token: {error_msg}"}), 400
