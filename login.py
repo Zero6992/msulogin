@@ -1,22 +1,38 @@
 from flask import Flask, render_template, request, jsonify, make_response
 import os
 import secrets
+import threading
 import time
 import requests
 import re
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
 
 # Sessions keyed by server-issued opaque ID (delivered via HttpOnly cookie),
 # never by the client-supplied wallet address.
 user_sessions = {}
+session_lock = threading.Lock()
 SESSION_TTL_SECONDS = 15 * 60
 SESSION_COOKIE_NAME = "msu_session"
 # Disable only for plain-HTTP local dev: COOKIE_SECURE=0
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
+# Hard ceiling so a step-1 flood cannot grow user_sessions without bound.
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "1000"))
+RATE_LIMIT = os.environ.get("RATE_LIMIT", "30/minute")
+
+# In-memory storage is fine for Railway's typical single-instance deploy.
+# Set RATELIMIT_STORAGE_URI=redis://... when scaling beyond one container.
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["200/minute"],
+    storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
+)
 JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
 )
@@ -61,10 +77,11 @@ DEFAULT_HEADERS = {
 
 def cleanup_expired_sessions():
     now = time.time()
-    for address, state in list(user_sessions.items()):
-        created_at = state.get("created_at", 0)
-        if now - created_at > SESSION_TTL_SECONDS:
-            user_sessions.pop(address, None)
+    with session_lock:
+        for sid, state in list(user_sessions.items()):
+            created_at = state.get("created_at", 0)
+            if now - created_at > SESSION_TTL_SECONDS:
+                user_sessions.pop(sid, None)
 
 
 def post_r(url, data, cookies=None, headers=None):
@@ -252,6 +269,7 @@ def index():
 
 
 @app.route('/api/launch', methods=['POST'])
+@limiter.limit(RATE_LIMIT)
 def launch():
     """Single endpoint that handles all the internal API calls."""
     try:
@@ -333,16 +351,19 @@ def launch():
             # The address is stored server-side so the client cannot pivot
             # to another user's session by changing the request body.
             sid = secrets.token_urlsafe(32)
-            user_sessions[sid] = {
-                "address": public_address,
-                "cookies": pre_cookies,
-                "created_at": time.time(),
-                "auth_jwt": None,
-                "jwt_candidates": [],
-                "login_address": login_address,
-                "step1_message": result["message"],
-                "step3_message": None,
-            }
+            with session_lock:
+                if len(user_sessions) >= MAX_SESSIONS:
+                    return jsonify({"success": False, "error": "Server busy"}), 503
+                user_sessions[sid] = {
+                    "address": public_address,
+                    "cookies": pre_cookies,
+                    "created_at": time.time(),
+                    "auth_jwt": None,
+                    "jwt_candidates": [],
+                    "login_address": login_address,
+                    "step1_message": result["message"],
+                    "step3_message": None,
+                }
 
             resp = make_response(jsonify(
                 {"success": True, "message": result["message"], "login_address": login_address}
