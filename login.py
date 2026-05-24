@@ -52,7 +52,8 @@ def post_r(url, data, cookies=None, headers=None):
         if headers:
             merged_headers.update(headers)
         response = requests.post(
-            url, json=data, cookies=cookies, headers=merged_headers, timeout=10
+            url, json=data, cookies=cookies, headers=merged_headers,
+            timeout=10, allow_redirects=False,
         )
         return response.json(), response.cookies.get_dict(), response.status_code
     except Exception as e:
@@ -67,7 +68,8 @@ def get_r(url, cookies=None, headers=None):
         if headers:
             merged_headers.update(headers)
         response = requests.get(
-            url, cookies=cookies, headers=merged_headers, timeout=10
+            url, cookies=cookies, headers=merged_headers,
+            timeout=10, allow_redirects=False,
         )
         return response.json(), response.cookies.get_dict(), response.status_code
     except Exception as e:
