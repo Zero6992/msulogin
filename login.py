@@ -12,6 +12,12 @@ from eth_account.messages import encode_defunct
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
 # Sessions keyed by server-issued opaque ID (delivered via HttpOnly cookie),
@@ -97,7 +103,9 @@ def post_r(url, data, cookies=None, headers=None):
         )
         return response.json(), response.cookies.get_dict(), response.status_code
     except Exception as e:
-        print(f"Error: {e}")
+        # Log type only — exception args may echo URL fragments back to
+        # caller-supplied input. Don't include {e} verbatim.
+        logger.warning("outbound request failed: %s", type(e).__name__)
         return None, None, None
 
 
@@ -113,7 +121,9 @@ def get_r(url, cookies=None, headers=None):
         )
         return response.json(), response.cookies.get_dict(), response.status_code
     except Exception as e:
-        print(f"Error: {e}")
+        # Log type only — exception args may echo URL fragments back to
+        # caller-supplied input. Don't include {e} verbatim.
+        logger.warning("outbound request failed: %s", type(e).__name__)
         return None, None, None
 
 
@@ -588,7 +598,7 @@ def launch():
         # Hide internals from the client; surface a correlation ID so an
         # operator can look the full traceback up in server logs.
         error_id = secrets.token_hex(8)
-        logging.getLogger(__name__).exception("launch failed [id=%s]", error_id)
+        logger.exception("launch failed [id=%s]", error_id)
         return jsonify({"success": False, "error": "Internal error", "id": error_id}), 500
 
 
