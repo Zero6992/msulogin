@@ -319,7 +319,9 @@ def _require_same_origin():
     """Reject state-changing requests whose Origin isn't same-host
     (or an explicit ALLOWED_ORIGINS entry). Defends against any future
     code change that loses CSRF protection by accident."""
-    if request.method == "GET":
+    # RFC 7231 safe methods carry no state change, so they need no Origin.
+    # HEAD in particular is what uptime monitors send; without it they see 403.
+    if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     origin = request.headers.get("Origin", "")
     if not origin:
