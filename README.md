@@ -20,13 +20,19 @@
 把這個 repo push 到 GitHub，然後在 Railway 建一個 service，選 *Deploy from GitHub repo*。
 Railway 會自動讀 `Procfile` 和 `requirements.txt`，用 `waitress` 啟動。
 
+`Procfile` 裡的 `--trusted-proxy` 系列參數是必要的：waitress 從 2.0 起預設會把所有
+`X-Forwarded-*` header 丟掉(`clear_untrusted_proxy_headers=True`)，不設就等於
+`ProxyFix` 空轉 —— rate limit 會拿到 Railway proxy 的 IP 而不是真實 client IP,
+HSTS 也永遠發不出來。只信任 `x-forwarded-for` 和 `x-forwarded-proto`;
+`x-forwarded-host` 刻意不信任,以免 `request.host` 被改掉而破壞 Origin 檢查。
+
 ### 2. 設定環境變數
 
 在 service 的 **Variables** 分頁加：
 
 | 變數 | 建議值 | 說明 |
 | --- | --- | --- |
-| `FORCE_HTTPS` | `1` | 開啟 HTTPS 強制轉址(需要 Railway 自帶的 TLS) |
+| `FORCE_HTTPS` | (不用設) | Railway edge 已經會把 HTTP 301 轉到 HTTPS,Talisman 這層是重複的 |
 | `RATE_LIMIT` | `30/minute` | 每個 IP 在 `/api/launch` 的速率上限 |
 | `MAX_SESSIONS` | `1000` | 同時 in-flight session 數上限 |
 | `ALLOWED_ORIGINS` | (空) | 額外允許的 Origin(逗號分隔);同網域已自動允許 |
@@ -76,7 +82,7 @@ COOKIE_SECURE=0 python login.py
 | --- | --- | --- |
 | `PORT` | `51222` | Railway 會自動帶入 |
 | `COOKIE_SECURE` | `1` | session cookie 的 Secure flag;本地 HTTP 才設 `0` |
-| `FORCE_HTTPS` | `0` | Talisman 是否強制 HTTPS;Railway 上設 `1` |
+| `FORCE_HTTPS` | `0` | Talisman 是否強制 HTTPS。Railway edge 已經在做,通常不用開。<br>**只有在 `Procfile` 有 `--trusted-proxy` 時才可以開**,否則 Talisman 永遠看不到 `X-Forwarded-Proto: https`,每個請求都會被轉址 → 無限迴圈 |
 | `SESSION_TTL_SECONDS` | (寫死 300) | 目前是程式碼常數,要改編輯 `login.py` |
 | `MAX_SESSIONS` | `1000` | session dict 容量上限 |
 | `RATE_LIMIT` | `30/minute` | `/api/launch` per-IP 上限 |
