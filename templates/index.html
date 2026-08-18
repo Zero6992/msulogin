@@ -181,6 +181,50 @@
     box-shadow:0 0 8px rgba(126,224,191,0.6);
   }
 
+  .mfa{
+    margin: 4px 0 22px;
+    padding:16px 16px 14px;
+    border:1px solid #3a2f33;
+    background:linear-gradient(180deg,#1c1518 0%,#171317 100%);
+    border-radius:12px;
+    animation: rise .3s ease both;
+  }
+  .mfa-label{
+    font-size:13.5px;
+    font-weight:600;
+    color:var(--text);
+    margin-bottom:4px;
+  }
+  .mfa-desc{
+    font-size:12.5px;
+    color:var(--text-dim);
+    line-height:1.55;
+    margin-bottom:12px;
+  }
+  .mfa-input{
+    flex:1;
+    min-width:0;
+    background:#14181e;
+    border:1px solid var(--line);
+    border-radius:10px;
+    color:var(--text);
+    font-family:"JetBrains Mono",ui-monospace,monospace;
+    font-size:20px;
+    letter-spacing:0.4em;
+    text-align:center;
+    padding:10px 14px;
+    outline:none;
+    transition:border-color .15s ease;
+  }
+  .mfa-input:focus{ border-color:var(--accent); }
+  .mfa-input::placeholder{ color:var(--text-mute); }
+  .mfa-error{
+    margin-top:10px;
+    font-size:12.5px;
+    color:var(--danger);
+    min-height:1em;
+  }
+
   .output-label{
     display:flex;
     align-items:baseline;
@@ -333,6 +377,16 @@
         </button>
       </div>
 
+      <div class="mfa" id="mfaPanel" hidden>
+        <div class="mfa-label">輸入 2FA 驗證碼</div>
+        <div class="mfa-desc" id="mfaDesc">此錢包已綁定 Google Authenticator，請輸入 App 上顯示的 6 位數驗證碼。</div>
+        <div class="row">
+          <input class="mfa-input" id="mfaInput" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" aria-label="2FA 驗證碼" />
+          <button class="btn btn-primary" id="mfaSubmit">確認</button>
+        </div>
+        <div class="mfa-error" id="mfaError"></div>
+      </div>
+
       <div class="output-label">
         <span class="lbl">啟動指令</span>
         <span class="hint" id="outputHint">尚未產生</span>
@@ -369,6 +423,12 @@
   const toast = $('toast');
   const toastIc = toast.querySelector('.ic');
   const toastText = $('toastText');
+  const mfaPanel = $('mfaPanel');
+  const mfaInput = $('mfaInput');
+  const mfaSubmit = $('mfaSubmit');
+  const mfaError = $('mfaError');
+  const mfaDesc = $('mfaDesc');
+  const MFA_DESC_DEFAULT = mfaDesc.textContent;
 
   const COPY_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
   const CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
@@ -428,6 +488,58 @@
     step2.classList.toggle('done', generated);
   }
 
+  function spinner(text){
+    return '<span style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span> ' + text;
+  }
+
+  function hideMfa(){
+    mfaPanel.hidden = true;
+    mfaError.textContent = '';
+    mfaInput.value = '';
+    mfaDesc.textContent = MFA_DESC_DEFAULT;
+  }
+
+  // Reveal the 2FA panel and resolve with the entered code, or reject if the
+  // user presses Escape. Used to pause the login flow while MSU waits for the
+  // account's Google Authenticator one-time code. `descText` names which gate
+  // (Wallet Connect vs MapleStory N Launch) is being verified.
+  function askMfaCode(errorMsg, descText){
+    return new Promise((resolve, reject)=>{
+      mfaPanel.hidden = false;
+      mfaDesc.textContent = descText || MFA_DESC_DEFAULT;
+      mfaError.textContent = errorMsg || '';
+      mfaInput.value = '';
+      setTimeout(()=> mfaInput.focus(), 30);
+
+      function cleanup(){
+        mfaSubmit.removeEventListener('click', onSubmit);
+        mfaInput.removeEventListener('keydown', onKey);
+      }
+      function onSubmit(){
+        const code = mfaInput.value.replace(/\D/g, '');
+        if (code.length < 6){
+          mfaError.textContent = '請輸入 6 位數驗證碼';
+          mfaInput.focus();
+          return;
+        }
+        cleanup();
+        resolve(code);
+      }
+      function onKey(e){
+        if (e.key === 'Enter'){ e.preventDefault(); onSubmit(); }
+        else if (e.key === 'Escape'){ e.preventDefault(); cleanup(); reject(new Error('已取消 2FA 驗證')); }
+      }
+      mfaSubmit.addEventListener('click', onSubmit);
+      mfaInput.addEventListener('keydown', onKey);
+    });
+  }
+
+  // Keep the 2FA field digits-only as the user types.
+  mfaInput.addEventListener('input', ()=>{
+    const v = mfaInput.value.replace(/\D/g, '').slice(0, 6);
+    if (v !== mfaInput.value) mfaInput.value = v;
+  });
+
   connectBtn.addEventListener('click', async ()=>{
     if (running) return;
     connectBtn.disabled = true;
@@ -469,6 +581,7 @@
     const inner = generateBtn.innerHTML;
     generateBtn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span> 處理中…';
     outputHint.textContent = '處理中…';
+    hideMfa();
 
     try {
       // Step 1: web message
@@ -479,10 +592,25 @@
       outputHint.textContent = '請在 MetaMask 簽第一段訊息';
       const signature1 = await signMessage(s1.message);
 
-      // Step 2: signin-wallet
-      generateBtn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span> 處理中…';
+      // Step 2: signin-wallet — replays with the 2FA code if the wallet has
+      // Google Authenticator bound (MSU answers REQUIRE_MFA_OTP until we send it).
+      generateBtn.innerHTML = spinner('處理中…');
       outputHint.textContent = '驗證中…';
-      const s2 = await apiLaunch({ step:2, address: connectedAddress, signature1 });
+      let s2 = await apiLaunch({ step:2, address: connectedAddress, signature1 });
+      let mfaTries = 0;
+      while (s2.mfa_required){
+        outputHint.textContent = '請輸入 2FA 驗證碼';
+        generateBtn.innerHTML = spinner('等待 2FA 驗證碼…');
+        const mfaCode = await askMfaCode(
+          mfaTries > 0 ? (s2.step2_error_detail || '驗證碼不正確，請再確認一次') : '',
+          '「Wallet Connect」已開啟 2FA，請輸入 Google Authenticator 上的 6 位數驗證碼。'
+        );
+        mfaTries++;
+        outputHint.textContent = '驗證 2FA…';
+        generateBtn.innerHTML = spinner('驗證 2FA…');
+        s2 = await apiLaunch({ step:2, address: connectedAddress, signature1, mfa_code: mfaCode });
+      }
+      hideMfa();
       if (s2.step2_error && !s2.has_jwt && !s2.has_auth_jwt){
         throw new Error(s2.step2_error_detail || '登入失敗');
       }
@@ -495,10 +623,28 @@
       outputHint.textContent = '請在 MetaMask 簽第二段訊息';
       const signature2 = await signMessage(s3.message);
 
-      // Step 4: webtogame
-      generateBtn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span> 取得 token…';
+      // Step 4: webtogame — a second, independent 2FA gate ("MapleStory N
+      // Launch") can sit here, so handle REQUIRE_MFA_OTP the same way as step 2.
+      generateBtn.innerHTML = spinner('取得 token…');
       outputHint.textContent = '取得 token…';
-      const s4 = await apiLaunch({ step:4, address: connectedAddress, signature2 });
+      let s4 = await apiLaunch({ step:4, address: connectedAddress, signature2 });
+      let mfa4Tries = 0;
+      while (s4.mfa_required){
+        outputHint.textContent = '請輸入 2FA 驗證碼（啟動遊戲）';
+        generateBtn.innerHTML = spinner('等待 2FA 驗證碼…');
+        const code = await askMfaCode(
+          mfa4Tries > 0 ? (s4.step4_error_detail || '驗證碼不正確或已過期，請再試一次') : '',
+          '「MapleStory N Launch」已開啟 2FA，請輸入目前 Google Authenticator 上的 6 位數驗證碼。'
+        );
+        mfa4Tries++;
+        outputHint.textContent = '驗證 2FA…';
+        generateBtn.innerHTML = spinner('驗證 2FA…');
+        s4 = await apiLaunch({ step:4, address: connectedAddress, signature2, mfa_code: code });
+      }
+      hideMfa();
+      if (!s4.command){
+        throw new Error(s4.error || s4.step4_error_detail || '未取得啟動指令');
+      }
 
       outputText.value = s4.command;
       outputBox.classList.add('has-value');
@@ -510,6 +656,7 @@
       outputHint.textContent = '產生失敗';
       showToast(`失敗：${e.message || '未知錯誤'}`, 'error');
     } finally {
+      hideMfa();
       generateBtn.innerHTML = inner;
       generateBtn.disabled = false;
       connectBtn.disabled = false;

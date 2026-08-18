@@ -85,6 +85,9 @@ SIGNATURE_RE = re.compile(r"^0x[0-9a-fA-F]{130}$")
 # inside a msul:// URL; rejecting anything else prevents an upstream-supplied
 # token from breaking out of the quoting or injecting launcher flags.
 GT_RE = re.compile(r"^[A-Za-z0-9_.+\-/=]+$")
+# Google Authenticator / MFA one-time code. Nexon's TOTP is 6 digits; accept
+# up to 8 to be safe. The real correctness check is done server-side by MSU.
+MFA_CODE_RE = re.compile(r"^[0-9]{6,8}$")
 
 
 def verify_signature(address, message, signature):
@@ -244,6 +247,96 @@ def is_error_result(result, status_code):
         if "too many sign up request" in msg:
             return True
     return False
+
+
+def is_mfa_required(result):
+    """True when signin-wallet is asking for the account's MFA one-time code.
+
+    MSU returns ACCOUNT_ERROR_CODE_REQUIRE_MFA_OTP (top-level code 7) when the
+    wallet has Google Authenticator bound and no `mfaCode` was supplied, and a
+    sibling MFA error (e.g. an invalid/expired code) when a wrong code was sent.
+    Both mean "prompt the user for the code and retry", so we match any
+    MFA/OTP-flavoured error detail rather than the exact enum."""
+    if not isinstance(result, dict):
+        return False
+    details = result.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict):
+                code = str(detail.get("code", ""))
+                if "MFA" in code or "OTP" in code:
+                    return True
+    msg = result_message(result).lower()
+    return "mfa otp" in msg or "mfa_otp" in msg
+
+
+def parse_mfa_code(data):
+    """Pull the optional MFA one-time code from a request body and reduce it to
+    bare digits (so pasted values like '123 456' still work). Returns "" when
+    absent."""
+    raw = data.get("mfa_code")
+    if isinstance(raw, (str, int)):
+        return re.sub(r"\D", "", str(raw))
+    return ""
+
+
+def friendly_mfa_error(result, status=None):
+    """Turn an MSU MFA/OTP error into a Traditional-Chinese hint. The raw enums
+    ("... | ACCOUNT_ERROR_CODE_ALREADY_USED_MFA_OTP_CODE | code 3") are unhelpful
+    to end users, and reusing a one-time code is an easy mistake to make."""
+    code = ""
+    if isinstance(result, dict):
+        for detail in (result.get("details") or []):
+            if isinstance(detail, dict):
+                c = str(detail.get("code", "")).upper()
+                if "MFA" in c or "OTP" in c:
+                    code = c
+                    break
+    raw = result_message(result).lower()
+    if "ALREADY_USED" in code or "already used" in raw:
+        return "這組驗證碼已經用過了，請等 Authenticator 跳下一組新碼再輸入"
+    if "EXPIRE" in code or "expired" in raw:
+        return "驗證碼已過期，請改用 Authenticator 上目前顯示的那組"
+    if "LOCK" in code or "locked" in raw:
+        return "驗證碼錯誤次數過多，帳號已暫時被鎖定，請稍後再試"
+    if "REQUIRE_MFA_OTP" in code:
+        return "請輸入 2FA 驗證碼"
+    if (any(k in code for k in ("INVALID", "MISMATCH", "WRONG", "NOT_MATCH"))
+            or "invalid" in raw or "not match" in raw):
+        return "驗證碼不正確，請再確認一次"
+    return "驗證碼不正確或已過期，請用 Authenticator 上目前顯示的那組再試一次"
+
+
+WEBTOGAME_URL = "https://msu.io/maplestoryn/api/web/token/webtogame"
+MFA_OTP_VERIFY_URL = "https://msu.io/api/mfa/otp/verify"
+MFA_SERVICE_MSN_LAUNCH = "MFA_ENABLE_SERVICE_MSN_LAUNCH"
+
+
+def verify_mfa_otp(otp_code, cookies, auth_jwt, service):
+    """Verify a one-time code against MSU's dedicated MFA endpoint.
+
+    The "MapleStory N Launch" 2FA gate isn't satisfied inline on webtogame: the
+    official frontend first POSTs the code to /api/mfa/otp/verify, and on success
+    the session is marked MFA-verified (carried back via cookies) so the next
+    webtogame call goes through. Returns (verified, detail, response_cookies)."""
+    headers = {}
+    if auth_jwt:
+        headers["Authorization"] = f"Bearer {auth_jwt}"
+    body = {
+        "mfaActionType": "MFA_ACTION_TYPE_VERIFY",
+        "mfaEnableService": service,
+        "otpCode": otp_code,
+        "keepAfterVerified": False,
+    }
+    result, resp_cookies, status = post_r(
+        MFA_OTP_VERIFY_URL, body, cookies, headers=headers or None
+    )
+    if isinstance(result, dict) and result.get("verified") is True:
+        return True, "", (resp_cookies or {})
+    limit = result.get("otpLimitInfo") if isinstance(result, dict) else None
+    if isinstance(limit, dict) and limit.get("isLocked"):
+        return False, "驗證碼錯誤次數過多，帳號已暫時被鎖定，請稍後再試", (resp_cookies or {})
+    return False, friendly_mfa_error(result, status), (resp_cookies or {})
 
 
 def collect_jwt_candidates(obj):
@@ -461,12 +554,30 @@ def launch():
             if not step1_message or not verify_signature(public_address, step1_message, signature1):
                 return jsonify({"success": False, "error": "Signature does not match wallet"}), 403
 
+            # Optional Google Authenticator / MFA one-time code. When the wallet
+            # has 2FA bound, MSU's signin-wallet takes the TOTP as its `mfaCode`
+            # string field; without it the API answers REQUIRE_MFA_OTP (code 7).
+            # The frontend collects the code and replays this same step with it,
+            # reusing the stored message + signature from the first attempt.
+            mfa_code = parse_mfa_code(data)
+            if mfa_code and not MFA_CODE_RE.match(mfa_code):
+                return jsonify({
+                    "success": True,
+                    "mfa_required": True,
+                    "step2_error": True,
+                    "step2_error_detail": "驗證碼格式錯誤，請輸入 6 位數字",
+                    "has_jwt": False,
+                    "has_auth_jwt": False,
+                })
+
             login_address = state.get("login_address") or public_address
             request_data = {
                 "address": login_address,
                 "signature": signature1,
                 "walletType": "WALLET_TYPE_METAMASK",
             }
+            if mfa_code:
+                request_data["mfaCode"] = mfa_code
             result, cookies, status_code = post_r(
                 "https://msu.io/maplestoryn/api/web/signin-wallet", request_data, user_cookies
             )
@@ -477,6 +588,9 @@ def launch():
             # Store cookies for this user (og behavior + merge).
             merged = merge_cookies(user_cookies, cookies)
             step2_error = is_error_result(result, status_code)
+            # When the only thing standing between us and a session is the 2FA
+            # code, tell the frontend to prompt for it and replay this step.
+            mfa_required = step2_error and is_mfa_required(result)
 
             # Fallback: if JWT is in body, capture it.
             msu_wat = (
@@ -535,7 +649,11 @@ def launch():
                     "has_jwt": bool(merged.get("msu_wat") or merged.get("msu_wrt")),
                     "has_auth_jwt": bool(auth_jwt),
                     "step2_error": step2_error,
-                    "step2_error_detail": extract_error_message(result, status_code),
+                    "step2_error_detail": (
+                        friendly_mfa_error(result, status_code)
+                        if mfa_required else extract_error_message(result, status_code)
+                    ),
+                    "mfa_required": mfa_required,
                 }
             )
 
@@ -581,6 +699,18 @@ def launch():
             if not step3_message or not verify_signature(public_address, step3_message, signature2):
                 return jsonify({"success": False, "error": "Signature does not match wallet"}), 403
 
+            # A second, independent 2FA gate ("MapleStory N Launch" in Account
+            # Security) sits in front of webtogame. Unlike step 2's inline code,
+            # its OTP is verified out-of-band: POST the code to /api/mfa/otp/verify
+            # first, then a plain webtogame call succeeds. See verify_mfa_otp().
+            mfa_code = parse_mfa_code(data)
+            if mfa_code and not MFA_CODE_RE.match(mfa_code):
+                return jsonify({
+                    "success": True,
+                    "mfa_required": True,
+                    "step4_error_detail": "驗證碼格式錯誤，請輸入 6 位數字",
+                })
+
             # Optional manual JWT from frontend.
             manual_msu_wat = data.get("msu_wat") or data.get("jwt")
             manual_msu_wrt = data.get("msu_wrt")
@@ -591,13 +721,45 @@ def launch():
                 auth_jwt = manual_msu_wat.strip()
                 if auth_jwt not in jwt_candidates:
                     jwt_candidates.insert(0, auth_jwt)
-            if not auth_jwt and user_cookies.get("msu_wat"):
-                auth_jwt = user_cookies.get("msu_wat")
-            if not auth_jwt:
-                auth_jwt = pick_auth_jwt(jwt_candidates, user_cookies)
-            user_cookies = refresh_web_token(user_cookies, auth_jwt=auth_jwt)
-            if not auth_jwt and user_cookies.get("msu_wat"):
-                auth_jwt = user_cookies.get("msu_wat")
+            # Establish ONE web token and use it consistently. Do NOT refresh
+            # here: webtogame binds a "stored token" to the (verified) session
+            # and rejects any newer issuance of it as MISMATCHED_STORED_TOKEN, so
+            # rotating the token — or letting the Authorization header disagree
+            # with the msu_wat cookie — breaks the launch flow. Pin the token on
+            # the first step-4 call so the OTP retry presents the exact same one.
+            token = (
+                state.get("web_token")
+                or user_cookies.get("msu_wat")
+                or auth_jwt
+                or pick_auth_jwt(jwt_candidates, user_cookies)
+            )
+            if not token:
+                user_cookies = refresh_web_token(user_cookies, auth_jwt=None)
+                token = user_cookies.get("msu_wat")
+            auth_jwt = token
+            if token:
+                # keep the Bearer header and the msu_wat cookie the same token,
+                # and pin it so a later retry reuses this exact issuance
+                user_cookies = inject_manual_jwt(user_cookies, msu_wat=token)
+                user_sessions[sid]["web_token"] = token
+
+            # If the user supplied an OTP, clear the "MapleStory N Launch" gate
+            # first via the dedicated verify endpoint. The verified state is bound
+            # to the session (same sessionKey), so keep OUR token stable and only
+            # adopt the non-token cookies the verify response returns.
+            if mfa_code:
+                verified, verify_detail, verify_cookies = verify_mfa_otp(
+                    mfa_code, user_cookies, auth_jwt, MFA_SERVICE_MSN_LAUNCH
+                )
+                for name, value in (verify_cookies or {}).items():
+                    if name != "msu_wat" and value:
+                        user_cookies[name] = value
+                if not verified:
+                    return jsonify({
+                        "success": True,
+                        "mfa_required": True,
+                        "step4_error_detail": verify_detail or "驗證碼不正確或已過期",
+                    })
 
             headers = {}
             if auth_jwt:
@@ -605,10 +767,7 @@ def launch():
 
             request_data = {"signature": signature2}
             result, cookies, _ = post_r(
-                "https://msu.io/maplestoryn/api/web/token/webtogame",
-                request_data,
-                user_cookies,
-                headers=headers or None,
+                WEBTOGAME_URL, request_data, user_cookies, headers=headers or None
             )
 
             # If JWT missing, try alternate verified candidates once.
@@ -621,10 +780,7 @@ def launch():
                     auth_jwt = alt_auth
                     headers = {"Authorization": f"Bearer {auth_jwt}"}
                     result, cookies, _ = post_r(
-                        "https://msu.io/maplestoryn/api/web/token/webtogame",
-                        request_data,
-                        user_cookies,
-                        headers=headers,
+                        WEBTOGAME_URL, request_data, user_cookies, headers=headers
                     )
 
             # Keep latest cookies for retry diagnostics.
@@ -653,6 +809,15 @@ def launch():
                 resp = make_response(jsonify({"success": True, "command": command}))
                 resp.delete_cookie(SESSION_COOKIE_NAME)
                 return resp
+            elif is_mfa_required(result):
+                # "MapleStory N Launch" 2FA. Leave the session intact (the
+                # stored game message + signature are reused) so the frontend
+                # can resubmit this step with a fresh OTP.
+                return jsonify({
+                    "success": True,
+                    "mfa_required": True,
+                    "step4_error_detail": extract_error_message(result),
+                })
             else:
                 error_msg = extract_error_message(result)
                 return jsonify({"success": False, "error": f"Failed to get game token: {error_msg}"}), 400
