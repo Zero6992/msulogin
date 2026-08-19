@@ -1,117 +1,113 @@
 # MSU Login Launcher
 
-開源、可自行架設的小工具：把 **MetaMask 的錢包簽名**橋接成 MapleStory N 的
-`msul://` 啟動指令。連錢包 → 簽名 → 複製產生的指令貼到瀏覽器 → 進遊戲。
+MSU Login Launcher 是一個可自行部署的 Flask 應用程式，負責將 MetaMask 的錢包簽名流程轉換為 MapleStory N Launcher 可處理的 `msul://` 啟動指令。
 
-> ⚠️ 非官方工具，依賴 msu.io 的內部 API。MSU 改版時可能失效；請自行評估使用。
+使用者在瀏覽器完成兩次訊息簽名後，後端會與 msu.io 交換登入憑證及遊戲 token，最後產生可交給本機 Launcher 執行的啟動指令。流程同時支援 MSU Account Security 中的 `Wallet Connect` 與 `MapleStory N Launch` 兩道 2FA 驗證。
 
----
+> [!WARNING]
+> 本專案是非官方工具，並依賴 msu.io 的未公開 API。上游介面或驗證流程變更時，功能可能失效。請先閱讀下方的[安全性與信任模型](#安全性與信任模型)，並自行評估使用風險。
 
 ## 運作流程
 
-1. 連接 MetaMask
-2. 在 MetaMask 簽第一段訊息（登入挑戰）
-3. 伺服器把簽名中繼給 msu.io，取得登入 session
-4. 簽第二段訊息（遊戲挑戰）→ 換回遊戲 token（`gt`）
-5. 產生 `msul://…` 指令，貼進瀏覽器網址列 → 啟動器開遊戲
+1. 前端透過 MetaMask 取得使用者的錢包位址。
+2. 後端向 msu.io 取得登入挑戰訊息，前端使用 `personal_sign` 完成第一次簽名。
+3. 後端驗證簽章與錢包位址相符，再將簽章送往 msu.io 建立登入 session。
+4. 後端取得遊戲挑戰訊息，前端完成第二次簽名。
+5. 後端以第二次簽章交換遊戲 token（`gt`），並組成 `msul://` 啟動指令。
+6. 使用者將指令貼入瀏覽器網址列，由本機 MapleStory N Launcher 啟動遊戲。
 
-若帳號在 MSU 的 **Account Security** 綁了 2FA（Google Authenticator），流程中會跳出
-輸入框要求 6 位數驗證碼。MSU 有兩道各自獨立的關卡，兩道都開的話會分別要求一次：
+若帳號已啟用 Google Authenticator，介面會在對應階段要求輸入 2FA 驗證碼。MSU 將兩項設定視為獨立驗證關卡，因此兩者都啟用時會各驗證一次：
 
-- **Wallet Connect** — 擋在登入（`signin-wallet`）
-- **MapleStory N Launch** — 擋在取得遊戲 token（`webtogame`）
+- `Wallet Connect`：建立 MSU 登入 session 前驗證。
+- `MapleStory N Launch`：取得遊戲 token 前驗證。
 
-## 使用前提
+## 使用需求
 
-每個使用者自己的電腦要有：
+- Python 3
+- 桌面版瀏覽器
+- MetaMask 瀏覽器擴充功能
+- 已註冊 `msul://` 協定的 MapleStory N Launcher
 
-- 桌面瀏覽器
-- MetaMask 擴充功能
-- 能處理 `msul://` 協定的 MapleStory N Launcher
+## 本機執行
 
----
-
-## 安全性與信任
-
-會擔心「在別人的網站授權錢包」很正常，這裡把實際狀況講清楚：
-
-**它做不到的事（重要）**
-
-- **只用 `personal_sign`（純訊息簽名），永遠不會要求交易或代幣授權。**
-  這種簽名帶有 `\x19Ethereum Signed Message` 前綴，本質上不可能是一筆交易或
-  `approve`，**沒辦法轉走、動用或授權你錢包裡的任何資產**。
-- **從不接觸你的私鑰或助記詞。** 簽名全程在 MetaMask 內完成，本服務只拿到
-  「簽名結果」這串 hex，你的金鑰永遠不會離開錢包。
-- 簽名前，請在 MetaMask 視窗**看清楚要簽的訊息內容**（應該是 msu.io 的登入挑戰
-  文字）。訊息內容是可讀的，覺得不對就別簽。
-
-**誠實說的殘餘風險**
-
-- 這個流程會把你的簽名在後端中繼給 msu.io，換回你的 **MSU 登入 / 遊戲 token**。
-  所以連到**別人架設**的站台，等於信任該站台會經手你這一次的 MSU session —— 惡意
-  站台在 token 有效期間內有機會存取你的 **MSU 帳號 / 遊戲**（但偷不到你的加密資產）。
-
-**所以最安全的用法 = 自己在本機跑**
-
-程式碼公開、可自行審閱，本機執行時簽名與 token 全程不離開你的電腦。想圖方便用別人
-架的站也可以，就自行判斷是否信任對方。
-
-**服務端的強化**（見 git history 的 `fix(security)` commits）
-
-- Session 用 server 端隨機 ID + `HttpOnly; Secure; SameSite=Strict` cookie，不拿錢包地址當 key
-- 每段簽名都用 `eth-account` 在本地驗證，確認確實出自該錢包
-- `/api/launch` 有 per-IP rate limit、in-flight session 數上限、`Origin` 檢查
-- 嚴格驗證 address、signature、`gt`、MFA 驗證碼的格式
-- CSP、HSTS、`X-Frame-Options` 等安全 header（透過 `flask-talisman`）
-- 例外不回傳 stack trace，只回一組 UUID
-- **不持久化任何東西**：token 只暫存在記憶體（5 分鐘 TTL），隨程序重啟消失
-
----
-
-## 自行架設 / 本地執行
+建立虛擬環境並安裝相依套件：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
 
-# 本機是純 HTTP，要關掉 cookie 的 Secure flag，瀏覽器才會帶 session cookie
+本機使用 HTTP 時，必須停用 session cookie 的 `Secure` 屬性：
+
+```bash
 COOKIE_SECURE=0 python login.py
 ```
 
-開 <http://127.0.0.1:51222> 使用。
+服務啟動後，前往 <http://127.0.0.1:51222>，連接 MetaMask 並依畫面指示完成簽名。產生的 `msul://` 指令需貼到瀏覽器網址列執行。
 
-要對外部署到任何平台，repo 附了 `Procfile`（用 `waitress` 起 WSGI），可直接沿用；
-放在會終止 TLS 的反向代理後面時，記得搭配 `--trusted-proxy` 並視情況開 `FORCE_HTTPS`。
-不過對一般使用者，**直接在本機跑是最單純也最安全的方式**。
+## 部署
+
+專案附有 `Procfile`，預設使用 Waitress 啟動單一處理程序，適合部署在由反向代理終止 TLS 的平台：
+
+```text
+web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --trusted-proxy='*' --trusted-proxy-count=1 --trusted-proxy-headers='x-forwarded-for x-forwarded-proto' login:app
+```
+
+正式環境應使用 HTTPS，並保留 `COOKIE_SECURE=1`。如果反向代理的層數或轉送標頭與上述設定不同，請同步調整 `--trusted-proxy`、`--trusted-proxy-count` 與 `--trusted-proxy-headers`。只有在應用程式能正確判斷原始請求使用 HTTPS 時，才應啟用 `FORCE_HTTPS=1`。
 
 ## 環境變數
 
-| 變數 | 預設 | 用途 |
+| 變數 | 預設值 | 說明 |
 | --- | --- | --- |
-| `PORT` | `51222` | 監聽埠；部署平台通常會自動帶入 |
-| `COOKIE_SECURE` | `1` | session cookie 的 Secure flag；本機純 HTTP 才設 `0` |
-| `FORCE_HTTPS` | `0` | Talisman 是否強制 HTTPS。**只有在反向代理有送 `--trusted-proxy` 時才可開**，否則看不到 `X-Forwarded-Proto: https`，會被無限轉址 |
-| `SESSION_TTL_SECONDS` | (寫死 300) | 目前是程式碼常數，要改請編輯 `login.py` |
-| `MAX_SESSIONS` | `1000` | 同時 in-flight session 數上限 |
-| `RATE_LIMIT` | `30/minute` | `/api/launch` per-IP 上限 |
-| `ALLOWED_ORIGINS` | (空) | 額外允許的 Origin（逗號分隔）；同網域已自動允許 |
-| `LOG_LEVEL` | `INFO` | logging 等級 |
-| `RATELIMIT_STORAGE_URI` | `memory://` | flask-limiter 儲存後端；多 instance 才需改成 `redis://…` |
+| `PORT` | `51222` | `Procfile` 使用的監聽埠；直接執行 `login.py` 時固定為 `51222`。 |
+| `COOKIE_SECURE` | `1` | 是否為 session cookie 設定 `Secure`；僅限本機 HTTP 開發時設為 `0`。 |
+| `FORCE_HTTPS` | `0` | 是否由 Flask-Talisman 強制重新導向 HTTPS。啟用前需確認反向代理的轉送標頭設定正確。 |
+| `MAX_SESSIONS` | `1000` | 記憶體內允許的作用中 session 數量上限。 |
+| `RATE_LIMIT` | `30/minute` | `/api/launch` 對每個 IP 套用的請求頻率限制。 |
+| `ALLOWED_ORIGINS` | 空值 | 額外允許的 Origin，以逗號分隔；同網域 Origin 會自動放行。 |
+| `LOG_LEVEL` | `INFO` | Python logging 等級。 |
+| `RATELIMIT_STORAGE_URI` | `memory://` | Flask-Limiter 的儲存後端；部署多個執行個體時應改用 Redis 等共用儲存。 |
 
-## 限制
+應用程式 session 的逾時門檻目前固定為 300 秒，由 `login.py` 中的 `SESSION_TTL_SECONDS` 控制，並非環境變數。
 
-- 非官方工具，靠 msu.io 內部 API 逆向而來，MSU 改版可能隨時失效
-- `msul://` 是本機協定，每台電腦都要自己裝對應的 launcher
-- 不存任何持久資料，所有 in-flight session 隨 process 重啟消失
-- 預設單 instance；要 scale 得改 `RATELIMIT_STORAGE_URI` 並改用外部 session store
+## 安全性與信任模型
 
-## 檔案結構
+### 錢包操作範圍
 
-```
-login.py             # Flask app + /api/launch 業務邏輯（含 2FA 流程）
-templates/index.html # 前端頁面 + MetaMask 互動 + 2FA 輸入
-requirements.txt     # 鎖版本的相依套件
-Procfile             # 選用：用 waitress 對外部署時的啟動指令
-.gitignore
+前端只會透過 MetaMask 呼叫 `eth_requestAccounts` 與 `personal_sign`。`personal_sign` 產生的是 EIP-191 訊息簽章，不會送出鏈上交易，也不會建立 ERC-20 代幣授權。私鑰與助記詞始終由 MetaMask 保管，不會傳送至本應用程式。
+
+訊息簽章仍具備身分驗證能力。簽名前應確認 MetaMask 顯示的內容確實是 msu.io 提供的登入或遊戲挑戰；內容不符時請取消操作。
+
+### 遠端站台的信任邊界
+
+後端必須接收簽章，並代為處理 MSU session cookie 與遊戲 token。使用第三方部署的站台，代表站台營運者在憑證有效期間內可能存取該次 MSU session 或遊戲帳號。這項風險與鏈上資產不同，但仍屬於帳號存取風險。
+
+建議自行在本機執行；若使用遠端版本，請先確認程式碼與站台營運者都值得信任。產生的 `msul://` 指令包含可用於啟動遊戲的 token，不應分享或寫入公開紀錄。
+
+### 已實作的防護
+
+- 以伺服器產生的隨機 session ID 綁定錢包位址，預設使用 `HttpOnly; Secure; SameSite=Strict` cookie。
+- 使用 `eth-account` 驗證兩次簽章，並比對伺服器端保留的原始挑戰訊息與錢包位址。
+- 對 `/api/launch` 套用每個 IP 的請求頻率限制、作用中 session 數量上限與 Origin 檢查。
+- 驗證錢包位址、簽章、遊戲 token 與 2FA 驗證碼格式。
+- 透過 Flask-Talisman 設定 CSP、HSTS、`X-Frame-Options` 與 Referrer Policy。
+- 未處理的例外只會向用戶端回傳追蹤 ID，完整錯誤堆疊僅保留於伺服器記錄。
+- MSU cookies 與 token 僅暫存在處理程序的記憶體中；session 逾時、啟動成功或服務重新啟動時會從記憶體移除，不會寫入應用程式資料庫或檔案。
+
+## 已知限制
+
+- msu.io 的未公開 API 沒有相容性保證，任何上游改版都可能中斷登入流程。
+- 僅支援 MetaMask；後端送往 MSU 的錢包類型固定為 `WALLET_TYPE_METAMASK`。
+- `msul://` 是本機自訂協定，每台使用者裝置都必須安裝對應的 Launcher。
+- session 與請求頻率限制的狀態預設儲存在單一處理程序的記憶體內。多處理程序或多執行個體部署需要共用的 session 儲存層，並為 Flask-Limiter 設定外部儲存後端。
+
+## 專案結構
+
+```text
+login.py             # Flask 應用程式、MSU API 流程與 2FA 處理
+templates/index.html # 使用者介面、MetaMask 互動與啟動指令輸出
+requirements.txt     # Python 相依套件與版本
+Procfile             # Waitress 部署啟動指令
+.gitignore           # Git 忽略規則
 ```
