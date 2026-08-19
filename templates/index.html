@@ -183,46 +183,81 @@
 
   .mfa{
     margin: 4px 0 22px;
-    padding:16px 16px 14px;
-    border:1px solid #3a2f33;
-    background:linear-gradient(180deg,#1c1518 0%,#171317 100%);
+    padding:20px;
+    border:1px solid var(--line-soft);
+    background:#14181e;
     border-radius:12px;
     animation: rise .3s ease both;
   }
-  .mfa-label{
-    font-size:13.5px;
-    font-weight:600;
-    color:var(--text);
-    margin-bottom:4px;
+  .mfa-head{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin-bottom:6px;
   }
+  .mfa-ic{ width:18px; height:18px; color:var(--accent); flex:0 0 auto; }
+  .mfa-title{ font-size:14px; font-weight:600; color:var(--text); }
+  .mfa-chip{
+    margin-left:auto;
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    font-size:11.5px;
+    color:var(--accent);
+    background:rgba(126,224,191,0.08);
+    border:1px solid rgba(126,224,191,0.22);
+    border-radius:999px;
+    padding:3px 10px;
+    white-space:nowrap;
+  }
+  .mfa-chip .cdot{ width:5px; height:5px; border-radius:50%; background:var(--accent); }
   .mfa-desc{
     font-size:12.5px;
     color:var(--text-dim);
     line-height:1.55;
-    margin-bottom:12px;
+    margin-bottom:16px;
   }
-  .mfa-input{
-    flex:1;
-    min-width:0;
-    background:#14181e;
+  .otp{ position:relative; display:block; }
+  .otp-row{ display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:10px; }
+  .otp-cell{
+    position:relative;
+    height:52px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:var(--bg-input);
     border:1px solid var(--line);
     border-radius:10px;
-    color:var(--text);
     font-family:"JetBrains Mono",ui-monospace,monospace;
-    font-size:20px;
-    letter-spacing:0.4em;
-    text-align:center;
-    padding:10px 14px;
-    outline:none;
-    transition:border-color .15s ease;
+    font-size:22px;
+    color:var(--text);
+    transition:border-color .15s ease, box-shadow .15s ease;
   }
-  .mfa-input:focus{ border-color:var(--accent); }
-  .mfa-input::placeholder{ color:var(--text-mute); }
+  .otp-cell.filled{ border-color:#33404a; }
+  .otp.focused .otp-cell.active{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(126,224,191,0.15); }
+  .otp.focused .otp-cell.active.empty::after{
+    content:"";
+    width:2px; height:24px;
+    background:var(--accent);
+    border-radius:1px;
+    animation:blink 1.1s steps(1) infinite;
+  }
+  .otp.err .otp-cell{ border-color:var(--danger); box-shadow:0 0 0 3px rgba(240,164,164,0.10); }
+  @keyframes blink{ 50%{ opacity:0; } }
+  .otp-input{
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    margin:0; padding:0; border:0;
+    background:transparent; color:transparent; caret-color:transparent;
+    font-size:22px; text-align:center; cursor:text;
+  }
+  .otp-input:focus{ outline:none; }
   .mfa-error{
-    margin-top:10px;
+    margin-top:12px;
     font-size:12.5px;
     color:var(--danger);
     min-height:1em;
+    line-height:1.5;
   }
 
   .output-label{
@@ -378,13 +413,25 @@
       </div>
 
       <div class="mfa" id="mfaPanel" hidden>
-        <div class="mfa-label">輸入 2FA 驗證碼</div>
-        <div class="mfa-desc" id="mfaDesc">此錢包已綁定 Google Authenticator，請輸入 App 上顯示的 6 位數驗證碼。</div>
-        <div class="row">
-          <input class="mfa-input" id="mfaInput" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" aria-label="2FA 驗證碼" />
-          <button class="btn btn-primary" id="mfaSubmit">確認</button>
+        <div class="mfa-head">
+          <svg class="mfa-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 4v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V7z"/><path d="M9.4 12l2 2 3.6-3.6"/></svg>
+          <span class="mfa-title">輸入 2FA 驗證碼</span>
+          <span class="mfa-chip" id="mfaChip" hidden><span class="cdot"></span><span id="mfaChipText"></span></span>
         </div>
+        <div class="mfa-desc" id="mfaDesc">此錢包已綁定 Google Authenticator，請輸入 App 上顯示的 6 位數驗證碼。</div>
+        <label class="otp" id="mfaOtp">
+          <div class="otp-row" id="mfaCells">
+            <div class="otp-cell"></div>
+            <div class="otp-cell"></div>
+            <div class="otp-cell"></div>
+            <div class="otp-cell"></div>
+            <div class="otp-cell"></div>
+            <div class="otp-cell"></div>
+          </div>
+          <input class="otp-input" id="mfaInput" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" aria-label="2FA 驗證碼" />
+        </label>
         <div class="mfa-error" id="mfaError"></div>
+        <button class="btn btn-primary" id="mfaSubmit" style="margin-top:16px;width:100%;justify-content:center;">確認</button>
       </div>
 
       <div class="output-label">
@@ -428,6 +475,10 @@
   const mfaSubmit = $('mfaSubmit');
   const mfaError = $('mfaError');
   const mfaDesc = $('mfaDesc');
+  const mfaOtp = $('mfaOtp');
+  const mfaCells = Array.from($('mfaCells').children);
+  const mfaChip = $('mfaChip');
+  const mfaChipText = $('mfaChipText');
   const MFA_DESC_DEFAULT = mfaDesc.textContent;
 
   const COPY_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -492,23 +543,42 @@
     return '<span style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite"></span> ' + text;
   }
 
+  // Paint the six cells from the hidden input's current value.
+  function renderOtp(){
+    const v = mfaInput.value;
+    for (let i = 0; i < mfaCells.length; i++){
+      const cell = mfaCells[i];
+      cell.textContent = v[i] || '';
+      cell.classList.toggle('filled', !!v[i]);
+      cell.classList.toggle('active', i === v.length);
+      cell.classList.toggle('empty', !v[i]);
+    }
+  }
+
   function hideMfa(){
     mfaPanel.hidden = true;
     mfaError.textContent = '';
     mfaInput.value = '';
+    renderOtp();
+    mfaOtp.classList.remove('err', 'focused');
     mfaDesc.textContent = MFA_DESC_DEFAULT;
+    mfaChip.hidden = true;
   }
 
   // Reveal the 2FA panel and resolve with the entered code, or reject if the
   // user presses Escape. Used to pause the login flow while MSU waits for the
-  // account's Google Authenticator one-time code. `descText` names which gate
-  // (Wallet Connect vs MapleStory N Launch) is being verified.
-  function askMfaCode(errorMsg, descText){
+  // account's Google Authenticator one-time code. `descText`/`gateLabel` name
+  // which gate (Wallet Connect vs MapleStory N Launch) is being verified.
+  function askMfaCode(errorMsg, descText, gateLabel){
     return new Promise((resolve, reject)=>{
       mfaPanel.hidden = false;
       mfaDesc.textContent = descText || MFA_DESC_DEFAULT;
+      if (gateLabel){ mfaChipText.textContent = gateLabel; mfaChip.hidden = false; }
+      else { mfaChip.hidden = true; }
       mfaError.textContent = errorMsg || '';
+      mfaOtp.classList.toggle('err', !!errorMsg);
       mfaInput.value = '';
+      renderOtp();
       setTimeout(()=> mfaInput.focus(), 30);
 
       function cleanup(){
@@ -519,6 +589,7 @@
         const code = mfaInput.value.replace(/\D/g, '');
         if (code.length < 6){
           mfaError.textContent = '請輸入 6 位數驗證碼';
+          mfaOtp.classList.add('err');
           mfaInput.focus();
           return;
         }
@@ -534,11 +605,15 @@
     });
   }
 
-  // Keep the 2FA field digits-only as the user types.
+  // Keep the 2FA field digits-only as the user types, and repaint the cells.
   mfaInput.addEventListener('input', ()=>{
     const v = mfaInput.value.replace(/\D/g, '').slice(0, 6);
     if (v !== mfaInput.value) mfaInput.value = v;
+    mfaOtp.classList.remove('err');
+    renderOtp();
   });
+  mfaInput.addEventListener('focus', ()=> mfaOtp.classList.add('focused'));
+  mfaInput.addEventListener('blur', ()=> mfaOtp.classList.remove('focused'));
 
   connectBtn.addEventListener('click', async ()=>{
     if (running) return;
@@ -603,7 +678,8 @@
         generateBtn.innerHTML = spinner('等待 2FA 驗證碼…');
         const mfaCode = await askMfaCode(
           mfaTries > 0 ? (s2.step2_error_detail || '驗證碼不正確，請再確認一次') : '',
-          '「Wallet Connect」已開啟 2FA，請輸入 Google Authenticator 上的 6 位數驗證碼。'
+          '「Wallet Connect」已開啟 2FA，請輸入 Google Authenticator 上的 6 位數驗證碼。',
+          'Wallet Connect'
         );
         mfaTries++;
         outputHint.textContent = '驗證 2FA…';
@@ -634,7 +710,8 @@
         generateBtn.innerHTML = spinner('等待 2FA 驗證碼…');
         const code = await askMfaCode(
           mfa4Tries > 0 ? (s4.step4_error_detail || '驗證碼不正確或已過期，請再試一次') : '',
-          '「MapleStory N Launch」已開啟 2FA，請輸入目前 Google Authenticator 上的 6 位數驗證碼。'
+          '「MapleStory N Launch」已開啟 2FA，請輸入目前 Google Authenticator 上的 6 位數驗證碼。',
+          'MapleStory N Launch'
         );
         mfa4Tries++;
         outputHint.textContent = '驗證 2FA…';
