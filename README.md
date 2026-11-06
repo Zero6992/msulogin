@@ -51,10 +51,12 @@ COOKIE_SECURE=0 python login.py
 專案附有 `Procfile`，預設使用 Waitress 啟動單一處理程序，適合部署在由反向代理終止 TLS 的平台：
 
 ```text
-web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --trusted-proxy='*' --trusted-proxy-count=1 --trusted-proxy-headers='x-forwarded-for x-forwarded-proto' login:app
+web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --max-request-body-size=16384 --trusted-proxy='*' --trusted-proxy-count=1 --trusted-proxy-headers='x-forwarded-for x-forwarded-proto' login:app
 ```
 
 正式環境應使用 HTTPS，並保留 `COOKIE_SECURE=1`。如果反向代理的層數或轉送標頭與上述設定不同，請同步調整 `--trusted-proxy`、`--trusted-proxy-count` 與 `--trusted-proxy-headers`。只有在應用程式能正確判斷原始請求使用 HTTPS 時，才應啟用 `FORCE_HTTPS=1`。
+
+`Procfile` 以 `--max-request-body-size=16384` 在 Waitress 層限制請求主體大小，應用程式端另以 `MAX_BODY_BYTES` 套用相同上限。轉送標頭（`X-Forwarded-For`、`X-Forwarded-Proto`）只由 Waitress 解析，應用程式預設不再額外套用 `ProxyFix`，以免同一個標頭被解析兩次、讓用戶端能自選限流用的 IP。只有在不使用 Waitress 的 proxy 選項、且前方恰好有一層可信任的反向代理時，才需要設定 `TRUST_PROXY_FIX=1`。
 
 ## 環境變數
 
@@ -64,12 +66,18 @@ web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --trusted-p
 | `COOKIE_SECURE` | `1` | 是否為 session cookie 設定 `Secure`；僅限本機 HTTP 開發時設為 `0`。 |
 | `FORCE_HTTPS` | `0` | 是否由 Flask-Talisman 強制重新導向 HTTPS。啟用前需確認反向代理的轉送標頭設定正確。 |
 | `MAX_SESSIONS` | `1000` | 記憶體內允許的作用中 session 數量上限。 |
+| `MAX_SESSIONS_PER_CLIENT` | `3` | 單一用戶端（IPv4 位址或 IPv6 /64 網段）可同時持有的作用中 session 數量上限，超過時回傳 429。瀏覽器重新開始步驟 1 時，會先取代其 cookie 所指的 session。許多使用者共用同一個公開 IP（NAT / CGNAT）時應調高此值；反向代理這一層也必須傳遞真實的用戶端 IP，否則所有人會共用同一份額度。 |
+| `SESSION_MAX_LIFETIME_SECONDS` | `600` | session 自建立起的絕對存活秒數；即使持續操作也不會延長，逾時後必須重新登入。 |
 | `RATE_LIMIT` | `30/minute` | `/api/launch` 對每個 IP 套用的請求頻率限制。 |
+| `STEP1_PER_ADDRESS_LIMIT` | `5/minute` | 步驟 1 對每組「錢包位址 + 用戶端」套用的請求頻率限制，超過時回傳 429。只計算已取得 session 名額、確定會呼叫 msu.io 的請求。啟動時即解析，格式錯誤會讓應用程式無法啟動。 |
+| `STEP1_PER_ADDRESS_GLOBAL_LIMIT` | `30/minute` | 步驟 1 對每個錢包位址（不分用戶端）套用的總量限制，計算方式與格式檢查同上。先通過上一項限制才會計入。 |
+| `MAX_BODY_BYTES` | `16384` | 請求主體大小上限（位元組），超過時回傳 413。 |
+| `TRUST_PROXY_FIX` | `0` | 設為 `1` 時以 `ProxyFix`（`x_for=1`、`x_proto=1`）解析轉送標頭。使用附帶的 `Procfile` 時應維持 `0`，由 Waitress 負責解析。 |
 | `ALLOWED_ORIGINS` | 空值 | 額外允許的 Origin，以逗號分隔；同網域 Origin 會自動放行。 |
 | `LOG_LEVEL` | `INFO` | Python logging 等級。 |
 | `RATELIMIT_STORAGE_URI` | `memory://` | Flask-Limiter 的儲存後端；部署多個執行個體時應改用 Redis 等共用儲存。 |
 
-應用程式 session 的逾時門檻目前固定為 300 秒，由 `login.py` 中的 `SESSION_TTL_SECONDS` 控制，並非環境變數。
+應用程式 session 的逾時門檻目前固定為 300 秒，由 `login.py` 中的 `SESSION_TTL_SECONDS` 控制，並非環境變數。瀏覽器的 session cookie 只在步驟 1 設定 `Max-Age`，因此自步驟 1 起 300 秒後即失效，不會隨後續步驟延長。伺服器端只在 session 成功完成簽入（步驟 2）後才會隨操作延長逾時，且總存活時間受 `SESSION_MAX_LIFETIME_SECONDS` 限制；這兩者實際上只約束持續送出 cookie 的非瀏覽器用戶端。
 
 ## 安全性與信任模型
 
@@ -89,8 +97,12 @@ web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --trusted-p
 
 - 以伺服器產生的隨機 session ID 綁定錢包位址，預設使用 `HttpOnly; Secure; SameSite=Strict` cookie。
 - 使用 `eth-account` 驗證兩次簽章，並比對伺服器端保留的原始挑戰訊息與錢包位址。
-- 對 `/api/launch` 套用每個 IP 的請求頻率限制、作用中 session 數量上限與 Origin 檢查。
-- 驗證錢包位址、簽章、遊戲 token 與 2FA 驗證碼格式。
+- 對 `/api/launch` 套用每個 IP 的請求頻率限制、步驟 1 的每錢包位址頻率限制（每組「位址 + 用戶端」與跨用戶端總量兩層，只計算確定會呼叫 msu.io 的請求）、Origin 檢查，以及請求主體大小上限（超過回傳 413）。
+- session 數量有全域上限與每個用戶端上限（IPv6 以 /64 計）；名額在呼叫 msu.io 之前就先保留，額滿時不會對外送出任何請求，瀏覽器重新開始步驟 1 則會取代其 cookie 所指的 session。
+- session 具有絕對存活時間，且只有成功簽入的 session 才會延長逾時，無法靠失敗的簽入嘗試長期佔用名額。
+- 驗證錢包位址、簽章、遊戲 token 與 2FA 驗證碼格式；手動提供的 token 限制字元集與長度，JWT 候選清單最多保留 3 個；msu.io 回傳的位址須與請求位址相符才會採用。
+- 轉送標頭只由 Waitress 解析，預設不啟用 `ProxyFix`，避免用戶端自選限流用的 IP。
+- `/api/` 回應附帶 `Cache-Control: no-store`，不記錄請求主體，2FA 驗證碼與 token 不會寫入日誌。
 - 透過 Flask-Talisman 設定 CSP、HSTS、`X-Frame-Options` 與 Referrer Policy。
 - 未處理的例外只會向用戶端回傳追蹤 ID，完整錯誤堆疊僅保留於伺服器記錄。
 - MSU cookies 與 token 僅暫存在處理程序的記憶體中；session 逾時、啟動成功或服務重新啟動時會從記憶體移除，不會寫入應用程式資料庫或檔案。
@@ -100,6 +112,7 @@ web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --trusted-p
 - msu.io 的未公開 API 沒有相容性保證，任何上游改版都可能中斷登入流程。
 - 僅支援 MetaMask；後端送往 MSU 的錢包類型固定為 `WALLET_TYPE_METAMASK`。
 - `msul://` 是本機自訂協定，每台使用者裝置都必須安裝對應的 Launcher。
+- 步驟 1 的每錢包位址限制分為「位址 + 用戶端」與跨用戶端總量兩層：單一用戶端無法靠重複請求耗盡他人的額度，但擁有多個不同用戶端（IPv4 位址或 IPv6 /64 網段；一台擁有 /56、/48 網段的主機就等於很多個）的攻擊者，仍可用完某個位址的總量。預設值下持續封鎖平均需要約 6 個用戶端；由於固定時間窗彼此不對齊，短時間內約 4 個就可能用完單一窗口的額度，使該位址的使用者需稍候再試。此限制只保護本服務；任何人仍可直接呼叫 msu.io 自己的端點。
 - session 與請求頻率限制的狀態預設儲存在單一處理程序的記憶體內。多處理程序或多執行個體部署需要共用的 session 儲存層，並為 Flask-Limiter 設定外部儲存後端。
 
 ## 專案結構

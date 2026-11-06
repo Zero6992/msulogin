@@ -1,4 +1,6 @@
 from flask import Flask, render_template, request, jsonify, make_response
+import functools
+import ipaddress
 import logging
 import os
 import secrets
@@ -13,6 +15,8 @@ from eth_account.messages import encode_defunct
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
+from limits import parse_many
+from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(
@@ -22,22 +26,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# Railway terminates TLS at its edge and forwards X-Forwarded-* headers.
-# Trust one hop so request.remote_addr, request.scheme, and request.host
-# reflect the real client instead of the edge proxy.
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+# Cap request bodies; the Procfile sets the same cap on waitress.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "16384"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
+# Under the Procfile, waitress already applies the trusted X-Forwarded-For and
+# X-Forwarded-Proto headers. ProxyFix would parse X-Forwarded-For a second time
+# and could pick a different client address, so it is off by default. Turn it
+# on (TRUST_PROXY_FIX=1) only when running without waitress's proxy options
+# behind exactly one trusted proxy.
+PROXY_FIX_ENABLED = os.environ.get("TRUST_PROXY_FIX", "0") == "1"
+if PROXY_FIX_ENABLED:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 # Sessions keyed by server-issued opaque ID (delivered via HttpOnly cookie),
 # never by the client-supplied wallet address.
 user_sessions = {}
 session_lock = threading.Lock()
 SESSION_TTL_SECONDS = 5 * 60
+# Absolute lifetime, so a session cannot be kept alive forever by refreshing.
+SESSION_MAX_LIFETIME_SECONDS = int(os.environ.get("SESSION_MAX_LIFETIME_SECONDS", "600"))
 SESSION_COOKIE_NAME = "msu_session"
 # Disable only for plain-HTTP local dev: COOKIE_SECURE=0
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"
 # Hard ceiling so a step-1 flood cannot grow user_sessions without bound.
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "1000"))
+# Live sessions one client (IPv4 address or IPv6 /64) may hold at once.
+MAX_SESSIONS_PER_CLIENT = int(os.environ.get("MAX_SESSIONS_PER_CLIENT", "3"))
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "30/minute")
+# Step-1 requests that reach msu.io, per (wallet address, client): one client
+# cannot churn one wallet's nonce.
+STEP1_PER_ADDRESS_LIMIT = os.environ.get("STEP1_PER_ADDRESS_LIMIT", "5/minute")
+# Looser cap per wallet address across all clients.
+STEP1_PER_ADDRESS_GLOBAL_LIMIT = os.environ.get("STEP1_PER_ADDRESS_GLOBAL_LIMIT", "30/minute")
+# Most JWT candidates kept per session (each one costs a verify round-trip).
+MAX_JWT_CANDIDATES = 3
 # Extra origins beyond same-host. Comma-separated. Empty = same-host only.
 ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()}
 
@@ -64,8 +86,9 @@ _csp = {
     "form-action": "'self'",
 }
 # force_https is OFF by default because Railway terminates TLS at its edge
-# and forwards plain HTTP to the container. Enable FORCE_HTTPS=1 once ProxyFix
-# is wired up so request.is_secure reflects the real client connection.
+# and forwards plain HTTP to the container. Enable FORCE_HTTPS=1 once the
+# proxy headers are trusted (waitress via the Procfile, or TRUST_PROXY_FIX=1) so
+# request.is_secure reflects the real client connection.
 Talisman(
     app,
     content_security_policy=_csp,
@@ -88,6 +111,8 @@ GT_RE = re.compile(r"^[A-Za-z0-9_.+\-/=]+$")
 # Google Authenticator / MFA one-time code. Nexon's TOTP is 6 digits; accept
 # up to 8 to be safe. The real correctness check is done server-side by MSU.
 MFA_CODE_RE = re.compile(r"^[0-9]{6,8}$")
+# Token characters accepted from the browser (JWT / base64url). Used with fullmatch.
+MANUAL_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-.]{1,4096}")
 
 
 def verify_signature(address, message, signature):
@@ -130,8 +155,104 @@ def cleanup_expired_sessions():
     with session_lock:
         for sid, state in list(user_sessions.items()):
             created_at = state.get("created_at", 0)
-            if now - created_at > SESSION_TTL_SECONDS:
+            born_at = state.get("born_at", created_at)
+            if (now - created_at > SESSION_TTL_SECONDS
+                    or now - born_at > SESSION_MAX_LIFETIME_SECONDS):
                 user_sessions.pop(sid, None)
+
+
+def client_key():
+    """Quota key for the caller: remote address, IPv6 grouped by /64."""
+    ip = get_remote_address() or ""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return ip
+
+
+def reserve_session(old_sid):
+    """Drop the caller's previous session and reserve a slot for a new one,
+    all under one lock and before any outbound call. Returns (sid, None) or
+    (None, (error, status))."""
+    key = client_key()
+    now = time.time()
+    with session_lock:
+        if old_sid:
+            user_sessions.pop(old_sid, None)
+        held = sum(1 for s in user_sessions.values() if s.get("client") == key)
+        if held >= MAX_SESSIONS_PER_CLIENT:
+            return None, ("Too many active sessions", 429)
+        if len(user_sessions) >= MAX_SESSIONS:
+            return None, ("Server busy", 503)
+        sid = secrets.token_urlsafe(32)
+        user_sessions[sid] = {
+            "client": key, "pending": True, "signed_in": False,
+            "created_at": now, "born_at": now,
+        }
+        return sid, None
+
+
+def release_session(sid):
+    with session_lock:
+        user_sessions.pop(sid, None)
+
+
+def update_session(sid, fields, refresh=False):
+    """Update a live session under the lock. Returns False if it is gone
+    (expired or finished meanwhile). refresh=True also moves created_at
+    forward, but only for sessions that completed step 2."""
+    with session_lock:
+        state = user_sessions.get(sid)
+        if state is None or state.get("pending"):
+            return False
+        state.update(fields)
+        if refresh and state.get("signed_in"):
+            state["created_at"] = time.time()
+        return True
+
+
+def session_gone():
+    return jsonify({"success": False, "error": "Session expired or missing"}), 401
+
+
+@functools.lru_cache(maxsize=None)
+def _parse_rate(rate):
+    # Exactly one limit per setting; "5/minute;100/hour" would otherwise
+    # silently keep only the first part.
+    parsed = parse_many(rate)
+    if len(parsed) != 1:
+        raise ValueError(f"expected exactly one rate limit, got {rate!r}")
+    return parsed[0]
+
+
+# Parse both limits at import so a malformed value stops the app at startup
+# instead of failing every step-1 request.
+_parse_rate(STEP1_PER_ADDRESS_LIMIT)
+_parse_rate(STEP1_PER_ADDRESS_GLOBAL_LIMIT)
+
+
+def step1_address_allowed(address):
+    """Per-wallet caps on step 1, counted in the limiter's own storage.
+
+    Call this only after reserve_session() succeeded, so a request that is
+    refused before reaching msu.io never uses up a wallet's budget (the address
+    is public, so that would let anyone lock a wallet out). The per-client
+    bucket is hit first: a client over its own limit must not use up the
+    shared one."""
+    if not limiter.enabled:
+        return True
+    strategy = limiter.limiter
+    return (
+        strategy.hit(_parse_rate(STEP1_PER_ADDRESS_LIMIT),
+                     "step1-address", address, client_key())
+        and strategy.hit(_parse_rate(STEP1_PER_ADDRESS_GLOBAL_LIMIT),
+                         "step1-address-global", address)
+    )
 
 
 def post_r(url, data, cookies=None, headers=None):
@@ -430,6 +551,14 @@ def _require_same_origin():
     return jsonify({"success": False, "error": "Origin not allowed"}), 403
 
 
+@app.after_request
+def _no_store_api(response):
+    # Responses from /api/ carry session state; keep them out of caches.
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -439,10 +568,16 @@ def index():
 @limiter.limit(RATE_LIMIT)
 def launch():
     """Single endpoint that handles all the internal API calls."""
+    reserved_sid = None  # step-1 slot; released unless step 1 succeeds
     try:
         cleanup_expired_sessions()
 
-        data = request.get_json(silent=True) or {}
+        request.get_data()  # raises 413 when the body exceeds MAX_CONTENT_LENGTH
+        data = request.get_json(silent=True)
+        if data is None:
+            data = {}
+        elif not isinstance(data, dict):
+            return jsonify({"success": False, "error": "Invalid request body"}), 400
         public_address = data.get('address')
         signature1 = data.get('signature1')
         signature2 = data.get('signature2')
@@ -458,16 +593,27 @@ def launch():
             if not isinstance(public_address, str) or not ADDRESS_RE.match(public_address.strip()):
                 return jsonify({"success": False, "error": "Invalid wallet address"}), 400
             public_address = public_address.strip().lower()
-            sid = None
+            # Reserve the slot before any outbound call. This also drops the
+            # session named by the caller's cookie, so a repeat step 1 from
+            # the same browser replaces it.
+            sid, refused = reserve_session(request.cookies.get(SESSION_COOKIE_NAME))
+            if refused:
+                return jsonify({"success": False, "error": refused[0]}), refused[1]
+            reserved_sid = sid
+            # Per-wallet limits count only requests that will reach msu.io; a
+            # refusal here releases the reservation (see `finally`).
+            if not step1_address_allowed(public_address):
+                return jsonify({"success": False, "error": "Too many requests for this wallet"}), 429
             state = {}
             user_cookies = {}
             auth_jwt = None
             jwt_candidates = []
         else:
             sid = request.cookies.get(SESSION_COOKIE_NAME)
-            state = user_sessions.get(sid) if sid else None
-            if not state:
-                return jsonify({"success": False, "error": "Session expired or missing"}), 401
+            with session_lock:
+                state = user_sessions.get(sid) if sid else None
+            if not state or state.get("pending"):
+                return session_gone()
             public_address = state["address"]
             user_cookies = state.get("cookies", {})
             auth_jwt = state.get("auth_jwt")
@@ -491,17 +637,16 @@ def launch():
             )
             pre_cookies = merge_cookies(pre_cookies, account_cookies)
 
-            # Use canonical address from account profile when available.
+            # Use the account profile's address (canonical casing) only when it
+            # is a well-formed form of the address that was asked for.
             account_obj = account_result.get("account") if isinstance(account_result, dict) else None
-            login_address = (
-                account_obj.get("address")
-                if isinstance(account_obj, dict) and isinstance(account_obj.get("address"), str)
-                else public_address
-            )
-            if isinstance(login_address, str):
-                login_address = login_address.strip() or public_address
-            else:
-                login_address = public_address
+            login_address = public_address
+            if isinstance(account_obj, dict):
+                upstream_address = account_obj.get("address")
+                if (isinstance(upstream_address, str)
+                        and ADDRESS_RE.fullmatch(upstream_address)
+                        and upstream_address.lower() == public_address):
+                    login_address = upstream_address
 
             request_data = {"address": login_address}
             result, message_cookies, _ = post_r(
@@ -514,14 +659,17 @@ def launch():
             if not (result and "message" in result):
                 return jsonify({"success": False, "error": "Failed to get message"}), 400
 
-            # Mint a fresh server-side session ID and bind it to the address.
-            # The address is stored server-side so the client cannot pivot
+            # Fill in the reserved session and bind it to the address. The
+            # address is stored server-side so the client cannot pivot
             # to another user's session by changing the request body.
-            sid = secrets.token_urlsafe(32)
             with session_lock:
-                if len(user_sessions) >= MAX_SESSIONS:
-                    return jsonify({"success": False, "error": "Server busy"}), 503
-                user_sessions[sid] = {
+                reserved = user_sessions.get(sid)
+                if reserved is None:
+                    # Only cleanup_expired_sessions() can drop a pending
+                    # reservation, i.e. it expired while msu.io was answering.
+                    return session_gone()
+                reserved.update({
+                    "pending": False,
                     "address": public_address,
                     "cookies": pre_cookies,
                     "created_at": time.time(),
@@ -530,7 +678,7 @@ def launch():
                     "login_address": login_address,
                     "step1_message": result["message"],
                     "step3_message": None,
-                }
+                })
 
             resp = make_response(jsonify(
                 {"success": True, "message": result["message"], "login_address": login_address}
@@ -540,6 +688,7 @@ def launch():
                 httponly=True, secure=COOKIE_SECURE, samesite="Strict",
                 max_age=SESSION_TTL_SECONDS,
             )
+            reserved_sid = None
             return resp
 
         # Step 2: signin-wallet
@@ -623,7 +772,7 @@ def launch():
             # Cap is intentionally tight: each candidate triggers a verify
             # round-trip in pick_auth_jwt, so a wide regex match would
             # amplify one inbound call into many outbound msu.io calls.
-            jwt_candidates = uniq[:3]
+            jwt_candidates = uniq[:MAX_JWT_CANDIDATES]
 
             # Do not issue extra auth requests when upstream Step2 is already an error.
             if not step2_error:
@@ -635,13 +784,19 @@ def launch():
                 if not auth_jwt and merged.get("msu_wat"):
                     auth_jwt = merged.get("msu_wat")
 
-            user_sessions[sid].update({
+            # Only a successful sign-in marks the session signed in and keeps it
+            # alive; a failed attempt must not extend its lifetime.
+            fields = {
                 "cookies": merged,
-                "created_at": time.time(),
                 "auth_jwt": auth_jwt,
                 "jwt_candidates": jwt_candidates,
                 "login_address": login_address,
-            })
+            }
+            if not step2_error:
+                fields["signed_in"] = True
+                fields["created_at"] = time.time()
+            if not update_session(sid, fields):
+                return session_gone()
 
             return jsonify(
                 {
@@ -673,24 +828,36 @@ def launch():
                 merged = refresh_web_token(merged, auth_jwt=auth_jwt)
                 if not auth_jwt and merged.get("msu_wat"):
                     auth_jwt = merged.get("msu_wat")
-                user_sessions[sid].update({
+                if not update_session(sid, {
                     "cookies": merged,
-                    "created_at": time.time(),
                     "auth_jwt": auth_jwt,
                     "jwt_candidates": jwt_candidates,
                     "login_address": login_address,
-                })
+                }, refresh=True):
+                    return session_gone()
                 user_cookies = merged
 
             if result and "message" in result:
                 # Remember the exact message so we can verify signature2 at step 4.
-                user_sessions[sid]["step3_message"] = result["message"]
+                if not update_session(sid, {"step3_message": result["message"]}):
+                    return session_gone()
                 return jsonify({"success": True, "message": result["message"]})
             else:
                 return jsonify({"success": False, "error": "Failed to get game message"}), 400
 
         # Step 4: web to game token and generate launch command
         elif step == 4:
+            # Optional manual tokens from the frontend. Check their shape first,
+            # before anything is sent upstream.
+            manual_tokens = {}
+            for field in ("msu_wat", "jwt", "msu_wrt"):
+                value = data.get(field)
+                if not value:
+                    continue
+                if not isinstance(value, str) or not MANUAL_TOKEN_RE.fullmatch(value.strip()):
+                    return jsonify({"success": False, "error": "Invalid token"}), 400
+                manual_tokens[field] = value.strip()
+
             if not isinstance(signature2, str) or not SIGNATURE_RE.match(signature2.strip()):
                 return jsonify({"success": False, "error": "Invalid signature2"}), 400
             signature2 = signature2.strip()
@@ -711,9 +878,8 @@ def launch():
                     "step4_error_detail": "驗證碼格式錯誤，請輸入 6 位數字",
                 })
 
-            # Optional manual JWT from frontend.
-            manual_msu_wat = data.get("msu_wat") or data.get("jwt")
-            manual_msu_wrt = data.get("msu_wrt")
+            manual_msu_wat = manual_tokens.get("msu_wat") or manual_tokens.get("jwt")
+            manual_msu_wrt = manual_tokens.get("msu_wrt")
             user_cookies = inject_manual_jwt(
                 user_cookies, msu_wat=manual_msu_wat, msu_wrt=manual_msu_wrt
             )
@@ -721,6 +887,8 @@ def launch():
                 auth_jwt = manual_msu_wat.strip()
                 if auth_jwt not in jwt_candidates:
                     jwt_candidates.insert(0, auth_jwt)
+            # The manual token must not widen the candidate list past the cap.
+            jwt_candidates = jwt_candidates[:MAX_JWT_CANDIDATES]
             # Establish ONE web token and use it consistently. Do NOT refresh
             # here: webtogame binds a "stored token" to the (verified) session
             # and rejects any newer issuance of it as MISMATCHED_STORED_TOKEN, so
@@ -741,7 +909,8 @@ def launch():
                 # keep the Bearer header and the msu_wat cookie the same token,
                 # and pin it so a later retry reuses this exact issuance
                 user_cookies = inject_manual_jwt(user_cookies, msu_wat=token)
-                user_sessions[sid]["web_token"] = token
+                if not update_session(sid, {"web_token": token}):
+                    return session_gone()
 
             # If the user supplied an OTP, clear the "MapleStory N Launch" gate
             # first via the dedicated verify endpoint. The verified state is bound
@@ -786,15 +955,15 @@ def launch():
             # Keep latest cookies for retry diagnostics.
             if cookies:
                 merged = merge_cookies(user_cookies, cookies)
-                user_sessions[sid].update({
+                if not update_session(sid, {
                     "cookies": merged,
-                    "created_at": time.time(),
                     "auth_jwt": auth_jwt,
                     "jwt_candidates": jwt_candidates,
-                })
+                }, refresh=True):
+                    return session_gone()
 
             gt = read_nested(result, "gt")
-            if isinstance(gt, str) and GT_RE.match(gt):
+            if isinstance(gt, str) and GT_RE.fullmatch(gt):
                 command = (
                     f"msul://launch/ -mode:launch -game:'106690@d811' "
                     f"-passarg:'{{\"gt\":\"{gt}\"}}' "
@@ -802,9 +971,12 @@ def launch():
                     f"-architectureplatform:'none' -timestamp:{int(time.time())} -language:'en-US'"
                 )
 
-                # Clean up stored cookies
-                if sid in user_sessions:
-                    del user_sessions[sid]
+                # Clean up stored cookies. If the session is already gone it
+                # expired or finished in another request.
+                with session_lock:
+                    finished = user_sessions.pop(sid, None)
+                if finished is None:
+                    return session_gone()
 
                 resp = make_response(jsonify({"success": True, "command": command}))
                 resp.delete_cookie(SESSION_COOKIE_NAME)
@@ -825,12 +997,19 @@ def launch():
         else:
             return jsonify({"success": False, "error": "Invalid step"}), 400
 
+    except HTTPException:
+        # e.g. 413 for an oversized body; let Flask answer with the right status.
+        raise
     except Exception:
         # Hide internals from the client; surface a correlation ID so an
         # operator can look the full traceback up in server logs.
         error_id = secrets.token_hex(8)
         logger.exception("launch failed [id=%s]", error_id)
         return jsonify({"success": False, "error": "Internal error", "id": error_id}), 500
+    finally:
+        # Any step-1 failure (return, error, exception) gives the slot back.
+        if reserved_sid:
+            release_session(reserved_sid)
 
 
 if __name__ == '__main__':
