@@ -767,3 +767,77 @@ def test_s9_no_logging_call_site_references_request_data():
             sites.append((node.lineno, mentioned & forbidden))
     assert sites, "expected to find logging call sites"
     assert [s for s in sites if s[1]] == []
+
+
+# ==========================================================================
+# Client IP from a proxy header (CLIENT_IP_HEADER, e.g. Railway's X-Real-IP)
+# ==========================================================================
+
+def _launch(ip_header=None, remote="10.0.0.1", body=None):
+    headers = dict(ORIGIN)
+    if ip_header is not None:
+        headers["X-Real-IP"] = ip_header
+    return login.app.test_client().post(
+        "/api/launch", json=body if body is not None else {"step": "x"},
+        headers=headers, environ_base={"REMOTE_ADDR": remote})
+
+
+def test_client_ip_header_is_off_by_default():
+    assert login.CLIENT_IP_HEADER == ""
+    with login.app.test_request_context(
+            "/", headers={"X-Real-IP": "198.51.100.1"},
+            environ_base={"REMOTE_ADDR": "203.0.113.5"}):
+        assert login.client_ip() == "203.0.113.5"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("198.51.100.1", "198.51.100.1"),
+    (" 198.51.100.1 ", "198.51.100.1"),
+    ("6.6.6.6, 198.51.100.2", "198.51.100.2"),  # proxy appended: its entry is last
+    ("2001:db8::1", "2001:db8::1"),
+    ("not-an-ip", login.UNKNOWN_CLIENT),
+    ('v1"z', login.UNKNOWN_CLIENT),
+    ("", login.UNKNOWN_CLIENT),
+    (None, login.UNKNOWN_CLIENT),  # header missing
+])
+def test_client_ip_header_takes_last_valid_entry(monkeypatch, value, expected):
+    monkeypatch.setattr(login, "CLIENT_IP_HEADER", "X-Real-IP")
+    headers = {} if value is None else {"X-Real-IP": value}
+    with login.app.test_request_context("/", headers=headers,
+                                        environ_base={"REMOTE_ADDR": "10.0.0.1"}):
+        assert login.client_ip() == expected
+
+
+def test_rate_limit_follows_client_ip_header_not_the_proxy_peer(monkeypatch):
+    monkeypatch.setattr(login, "CLIENT_IP_HEADER", "X-Real-IP")
+    limit = int(login.RATE_LIMIT.split("/")[0])
+    # Same client behind rotating proxy peers: one bucket.
+    codes = [_launch("198.51.100.7", remote=f"10.0.0.{i % 5 + 1}").status_code
+             for i in range(limit + 1)]
+    assert codes[:limit] == [400] * limit
+    assert codes[limit] == 429
+    # A different client through the same proxy peer is not affected.
+    assert _launch("198.51.100.8", remote="10.0.0.1").status_code == 400
+
+
+def test_bad_client_ip_header_cannot_rotate_rate_limit_keys(monkeypatch):
+    monkeypatch.setattr(login, "CLIENT_IP_HEADER", "X-Real-IP")
+    limit = int(login.RATE_LIMIT.split("/")[0])
+    codes = [_launch(f"junk-{i}", remote=f"10.0.0.{i % 5 + 1}").status_code
+             for i in range(limit + 1)]
+    assert codes[limit] == 429  # all malformed values share one bucket
+
+
+def test_session_quota_follows_client_ip_header(monkeypatch, upstream, new_wallet):
+    monkeypatch.setattr(login, "CLIENT_IP_HEADER", "X-Real-IP")
+    tiny(monkeypatch, MAX_SESSIONS_PER_CLIENT=1)
+
+    def step1(client_ip, peer):
+        return login.app.test_client().post(
+            "/api/launch", json={"step": 1, "address": new_wallet().address},
+            headers={**ORIGIN, "X-Real-IP": client_ip},
+            environ_base={"REMOTE_ADDR": peer})
+
+    assert step1("198.51.100.7", "10.0.0.1").status_code == 200
+    assert step1("198.51.100.7", "10.0.0.2").status_code == 429  # same client, other peer
+    assert step1("198.51.100.8", "10.0.0.1").status_code == 200  # other client, same peer

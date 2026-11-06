@@ -63,10 +63,31 @@ MAX_JWT_CANDIDATES = 3
 # Extra origins beyond same-host. Comma-separated. Empty = same-host only.
 ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()}
 
+# Header in which the reverse proxy passes the real client IP (Railway:
+# X-Real-IP). Empty = use the connection's remote address. Set it only when the
+# proxy always sets this header itself, so clients cannot choose the value.
+CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
+# Key for requests whose client IP header is missing or malformed. One shared
+# bucket, so a bad header cannot be used to rotate rate-limit keys.
+UNKNOWN_CLIENT = "unknown-client"
+
+
+def client_ip():
+    """The caller's IP, used for rate limits and session quotas."""
+    if not CLIENT_IP_HEADER:
+        return get_remote_address()
+    # If the proxy appended to a client-sent value, the proxy's entry is last.
+    value = request.headers.get(CLIENT_IP_HEADER, "").split(",")[-1].strip()
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return UNKNOWN_CLIENT
+
+
 # In-memory storage is fine for Railway's typical single-instance deploy.
 # Set RATELIMIT_STORAGE_URI=redis://... when scaling beyond one container.
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=client_ip,
     app=app,
     default_limits=["200/minute"],
     storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
@@ -162,8 +183,8 @@ def cleanup_expired_sessions():
 
 
 def client_key():
-    """Quota key for the caller: remote address, IPv6 grouped by /64."""
-    ip = get_remote_address() or ""
+    """Quota key for the caller: client IP, IPv6 grouped by /64."""
+    ip = client_ip() or ""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:

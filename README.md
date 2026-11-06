@@ -54,7 +54,7 @@ COOKIE_SECURE=0 python login.py
 web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --max-request-body-size=16384 --trusted-proxy='*' --trusted-proxy-count=1 --trusted-proxy-headers='x-forwarded-for x-forwarded-proto' login:app
 ```
 
-部署到 Railway 時，服務設定中的 Custom Start Command 會覆寫 `Procfile`。請讓它保持空白，或與上面這行完全相同；否則 Waitress 不會套用 proxy 與請求大小選項，所有使用者會被視為同一個 IP，共用限流與 session 額度。
+部署到 Railway 時，服務設定中的 Custom Start Command 會覆寫 `Procfile`。請讓它保持空白，或與上面這行完全相同；否則 Waitress 不會套用 proxy 與請求大小選項。另外，Railway 的 `X-Forwarded-For` 最後一筆並不是用戶端 IP，請設定 `CLIENT_IP_HEADER=X-Real-IP`，改用 Railway 填入的 `X-Real-IP` 識別用戶端；否則限流與每用戶端 session 上限無法依使用者計算。
 
 正式環境應使用 HTTPS，並保留 `COOKIE_SECURE=1`。如果反向代理的層數或轉送標頭與上述設定不同，請同步調整 `--trusted-proxy`、`--trusted-proxy-count` 與 `--trusted-proxy-headers`。只有在應用程式能正確判斷原始請求使用 HTTPS 時，才應啟用 `FORCE_HTTPS=1`。
 
@@ -75,6 +75,7 @@ web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --max-reque
 | `STEP1_PER_ADDRESS_GLOBAL_LIMIT` | `30/minute` | 步驟 1 對每個錢包位址（不分用戶端）套用的總量限制，計算方式與格式檢查同上。先通過上一項限制才會計入。 |
 | `MAX_BODY_BYTES` | `16384` | 請求主體大小上限（位元組），超過時回傳 413。 |
 | `TRUST_PROXY_FIX` | `0` | 設為 `1` 時以 `ProxyFix`（`x_for=1`、`x_proto=1`）解析轉送標頭。使用附帶的 `Procfile` 時應維持 `0`，由 Waitress 負責解析。 |
+| `CLIENT_IP_HEADER` | 空值 | 反向代理用來傳遞真實用戶端 IP 的標頭名稱（Railway 為 `X-Real-IP`）。設定後，限流與 session 上限都以此標頭的最後一個 IP 計算；標頭缺少或格式錯誤的請求共用同一個額度。只有在代理一定會自行寫入此標頭、用戶端無法指定其值時才可設定。 |
 | `ALLOWED_ORIGINS` | 空值 | 額外允許的 Origin，以逗號分隔；同網域 Origin 會自動放行。 |
 | `LOG_LEVEL` | `INFO` | Python logging 等級。 |
 | `RATELIMIT_STORAGE_URI` | `memory://` | Flask-Limiter 的儲存後端；部署多個執行個體時應改用 Redis 等共用儲存。 |
@@ -103,7 +104,7 @@ web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --max-reque
 - session 數量有全域上限與每個用戶端上限（IPv6 以 /64 計）；名額在呼叫 msu.io 之前就先保留，額滿時不會對外送出任何請求，瀏覽器重新開始步驟 1 則會取代其 cookie 所指的 session。
 - session 具有絕對存活時間，且只有成功簽入的 session 才會延長逾時，無法靠失敗的簽入嘗試長期佔用名額。
 - 驗證錢包位址、簽章、遊戲 token 與 2FA 驗證碼格式；手動提供的 token 限制字元集與長度，JWT 候選清單最多保留 3 個；msu.io 回傳的位址須與請求位址相符才會採用。
-- 轉送標頭只由 Waitress 解析，預設不啟用 `ProxyFix`，避免用戶端自選限流用的 IP。
+- 轉送標頭只由 Waitress 解析，預設不啟用 `ProxyFix`，避免用戶端自選限流用的 IP；部署在 Railway 時以 `CLIENT_IP_HEADER=X-Real-IP` 取得真實用戶端 IP。
 - `/api/` 回應附帶 `Cache-Control: no-store`，不記錄請求主體，2FA 驗證碼與 token 不會寫入日誌。
 - 透過 Flask-Talisman 設定 CSP、HSTS、`X-Frame-Options` 與 Referrer Policy。
 - 未處理的例外只會向用戶端回傳追蹤 ID，完整錯誤堆疊僅保留於伺服器記錄。
