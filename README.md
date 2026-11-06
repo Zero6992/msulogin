@@ -54,6 +54,8 @@ COOKIE_SECURE=0 python login.py
 web: waitress-serve --host=0.0.0.0 --port=${PORT:-51222} --threads=8 --max-request-body-size=16384 --trusted-proxy='*' --trusted-proxy-count=1 --trusted-proxy-headers='x-forwarded-for x-forwarded-proto' login:app
 ```
 
+部署到 Railway 時，`railway.json` 會以同一行指令設定 start command，並覆寫 Railway 介面上的自訂 Start Command，避免介面設定蓋掉 `Procfile` 的 proxy 與請求大小選項。修改啟動指令時請同步更新兩個檔案。
+
 正式環境應使用 HTTPS，並保留 `COOKIE_SECURE=1`。如果反向代理的層數或轉送標頭與上述設定不同，請同步調整 `--trusted-proxy`、`--trusted-proxy-count` 與 `--trusted-proxy-headers`。只有在應用程式能正確判斷原始請求使用 HTTPS 時，才應啟用 `FORCE_HTTPS=1`。
 
 `Procfile` 以 `--max-request-body-size=16384` 在 Waitress 層限制請求主體大小，應用程式端另以 `MAX_BODY_BYTES` 套用相同上限。轉送標頭（`X-Forwarded-For`、`X-Forwarded-Proto`）只由 Waitress 解析，應用程式預設不再額外套用 `ProxyFix`，以免同一個標頭被解析兩次、讓用戶端能自選限流用的 IP。只有在不使用 Waitress 的 proxy 選項、且前方恰好有一層可信任的反向代理時，才需要設定 `TRUST_PROXY_FIX=1`。
@@ -122,5 +124,7 @@ login.py             # Flask 應用程式、MSU API 流程與 2FA 處理
 templates/index.html # 使用者介面、MetaMask 互動與啟動指令輸出
 requirements.txt     # Python 相依套件與版本
 Procfile             # Waitress 部署啟動指令
+railway.json         # Railway 啟動指令（與 Procfile 相同，覆寫介面設定）
+tests/               # 安全性回歸測試（pytest，msu.io 呼叫皆為模擬）
 .gitignore           # Git 忽略規則
 ```
